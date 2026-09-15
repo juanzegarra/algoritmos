@@ -1,0 +1,6 @@
+Trait: Human-host
+Classifier: linear
+Test accuracy: 0.6667
+Confusion matrix:
+[[2 1]
+ [1 2]]

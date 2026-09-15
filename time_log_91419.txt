@@ -1,0 +1,5 @@
+total time	87.84807658195496
+k-merization time	0.01 seconds
+visualization time	1.06 seconds
+tree time	3.64 seconds
+node classification time	82.76 seconds
