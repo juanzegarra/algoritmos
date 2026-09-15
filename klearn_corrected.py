@@ -1,7 +1,14 @@
 # kmeans com valor de K cumsum=0.9 FEITO
 # cumsum=0.9 usar o aux de 0.9 para consturir arvore FEITO
 # plotar pesos da regressão FEITO
-# fazer arvore com alinhamento multiplo e neighbor-joining
+# fazer arvore com alinhamento multiplo e neighbor-joining FEITO
+# Implementar paralelismo no classificador dos nós
+# Paralelismo no bootstrap das árvores
+# Fazer plot do P(x) ordenado cor diferente para os labels
+# Aumentar numero de kmers para
+# Retornar kmers dos labels
+# Kmer = 4
+# Nao fazer pca e sim projetar no R3 o s com valores igual 0.9 ou 0.7
 
 """
 klearn.py
@@ -41,6 +48,7 @@ import argparse
 import os
 from multiprocessing import Pool
 import time
+from turtle import seth
 
 import numpy as np
 import pandas as pd
@@ -54,6 +62,7 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
+import scipy.io
 
 from sklearn.decomposition import TruncatedSVD
 from sklearn.cluster import KMeans
@@ -298,6 +307,13 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     s = svd.singular_values_
     sum_s2_total = np.sum(s ** 2)
     n_top = min(3, max_components)
+    plot_svds = plt.figure(figsize=(10, 6))
+    plt.plot(s, 'o-')
+    plt.xlabel('Singular Value Index')
+    plt.ylabel('Singular Value')
+    plt.title('Singular Values')
+    plt.show()
+
 
     if np.cumsum(svd.explained_variance_ratio_)[:n_top].sum() < 0.7:
         while np.cumsum(svd.explained_variance_ratio_)[:n_top].sum() < 0.7:
@@ -495,16 +511,16 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
     refit on just those 20 features, and return the refit weights together
     with their indices IN THE ORIGINAL FEATURE SPACE."""
     plot_weights(weight_vector, trait_name='all_weights', out_dir=out_dir)
-    lowest_idx = np.argsort(weight_vector)[:10]
-    highest_idx = np.argsort(weight_vector)[-10:][::-1]
+    lowest_idx = np.argsort(weight_vector)[:20]
+    highest_idx = np.argsort(weight_vector)[-20:][::-1]
     selected_idx = np.concatenate([lowest_idx, highest_idx])
 
     A_selected = A[:, selected_idx]
     weight_vector_selected = fit_linear_classifier(A_selected, indicadores, method=classifier)
 
     order = np.argsort(weight_vector_selected)
-    lowest_local = order[:10]
-    highest_local = order[-10:][::-1]
+    lowest_local = order[:20]
+    highest_local = order[-20:][::-1]
     final_local = np.concatenate([lowest_local, highest_local])
 
     final_original_idx = selected_idx[final_local]
@@ -683,6 +699,7 @@ def main():
 
     # 4. Build feature matrix
     A = montaA(sequences)
+    scipy.io.savemat(os.path.join(out_dir, "feature_matrix.mat"), {"A": A})
     np.save(os.path.join(out_dir, "feature_matrix.npy"), A)
 
     # 5. SVD / PCA visualization
