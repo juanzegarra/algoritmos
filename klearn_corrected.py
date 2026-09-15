@@ -1,14 +1,9 @@
-# kmeans com valor de K cumsum=0.9 FEITO
-# cumsum=0.9 usar o aux de 0.9 para consturir arvore FEITO
-# plotar pesos da regressão FEITO
-# fazer arvore com alinhamento multiplo e neighbor-joining FEITO
 # Implementar paralelismo no classificador dos nós
 # Paralelismo no bootstrap das árvores
 # Fazer plot do P(x) ordenado cor diferente para os labels
-# Aumentar numero de kmers para
+# Aumentar numero de kmers para classificação
 # Retornar kmers dos labels
 # Kmer = 4
-# Nao fazer pca e sim projetar no R3 o s com valores igual 0.9 ou 0.7
 
 """
 klearn.py
@@ -422,8 +417,9 @@ def fit_linear_classifier(A, indicadores, method='linear'):
 
 # plot the feature weights
 def plot_weights(w, out_dir=None, trait_name='trait'):
+    w = np.sort(w)
     plt.figure()
-    plt.bar(range(len(w)), w)
+    plt.plot(range(len(w)), w, "*", s=10)
     plt.xlabel('Feature')
     plt.ylabel('Weight')
     plt.title(f'Feature weights for {trait_name}')
@@ -436,8 +432,9 @@ def logistica(A, indicadores):
     return fit_linear_classifier(A, indicadores, method='linear')
 
 
+## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
-                         test_size=0.25, random_state=42):
+                         test_size=0.25, random_state=42, w=None):
     """Train/test split, fit `method` classifier, and save a figure with a
     confusion matrix and ROC curve to out_dir. Returns test accuracy."""
     indicadores = np.asarray(indicadores)
@@ -454,8 +451,10 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         )
 
     if method == 'linear':
-        w = fit_linear_classifier(X_train, y_train, method='linear')
-        scores_test = X_test @ w
+        if w is None:
+            w = fit_linear_classifier(X_train, y_train, method='linear')
+        w_red, kmer_idx = reduce_weights(A, w, indicadores, classifier='linear', out_dir=out_dir)
+        scores_test = X_test @ w_red
         y_pred = np.where(scores_test >= 0, 1, 0)
     elif method == 'logreg':
         model = LogisticRegression(max_iter=1000)
@@ -716,14 +715,15 @@ def main():
 
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
-        for t_idx, trait_name in enumerate(trait_names):
-            y = annotation_matrix[:, t_idx]
-            if len(np.unique(y)) < 2:
-                print(f"Skipping trait '{trait_name}': only one class present.")
-                continue
-            acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
-                                       method=classifier_method, test_size=test_size)
-            print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
+        with open(os.path.join(out_dir, "important_kmers_annotation.txt"), "w") as f:
+            for t_idx, trait_name in enumerate(trait_names):
+                y = annotation_matrix[:, t_idx]
+                if len(np.unique(y)) < 2:
+                    print(f"Skipping trait '{trait_name}': only one class present.")
+                    continue
+                acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
+                                           method=classifier_method, test_size=test_size)
+                print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
 
     # 8. Phylogenetics
     tree = None
