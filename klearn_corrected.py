@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # new seq classifcation -> find a way to parse several sequences for classification without breaking ram and parallelizing classifcation
 # 2.(sen.spec)/sen+spec
 # gavish donoho
@@ -36,6 +37,19 @@ classify_new_sequences should check dimensions before the matrix multiply, write
 [ ] Move the scipy imports to the top, and drop the import scipy.sparse as sp inside main.
 [ ] Only X is filtered as an invalid residue. B, Z, U, O, * and - become features.
 [ ] --fasta isn’t required. A missing file is handled, but keep it optional only for assemble mode.'''
+=======
+# kmeans com valor de K cumsum=0.9 FEITO
+# cumsum=0.9 usar o aux de 0.9 para consturir arvore FEITO
+# plotar pesos da regressão FEITO
+# fazer arvore com alinhamento multiplo e neighbor-joining FEITO
+# Implementar paralelismo no classificador dos nós
+# Paralelismo no bootstrap das árvores
+# Fazer plot do P(x) ordenado cor diferente para os labels
+# Aumentar numero de kmers para
+# Retornar kmers dos labels
+# Kmer = 4
+# Nao fazer pca e sim projetar no R3 o s com valores igual 0.9 ou 0.7
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
 
 """
 klearn.py
@@ -81,8 +95,12 @@ import os
 from multiprocessing import Pool
 import multiprocessing as mp
 import time
+<<<<<<< HEAD
 from collections import defaultdict
 
+=======
+from turtle import seth
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
 
 import numpy as np
 import pandas as pd
@@ -96,11 +114,15 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
+<<<<<<< HEAD
 from scipy.sparse import csr_matrix
 import scipy.sparse as sp
 from optht import optht
 
 
+=======
+import scipy.io
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
 
 from sklearn.decomposition import TruncatedSVD
 from sklearn.cluster import KMeans
@@ -440,9 +462,20 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
 
     s = svd_optimal.singular_values_
     sum_s2_total = np.sum(s ** 2)
+<<<<<<< HEAD
     n_top = min(3, A_k.shape[1])
     explained_variance = np.sort(svd_optimal.explained_variance_ratio_)
     cumulative_variance = np.cumsum(ev) / ev.sum()
+=======
+    n_top = min(3, max_components)
+    plot_svds = plt.figure(figsize=(10, 6))
+    plt.plot(s, 'o-')
+    plt.xlabel('Singular Value Index')
+    plt.ylabel('Singular Value')
+    plt.title('Singular Values')
+    plt.show()
+
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
 
     scree_fig, scree_ax = plt.subplots(figsize=(10, 6))
     scree_ax.plot(s, 'o-')
@@ -703,6 +736,7 @@ def coordinate_compression(l):
     compressed_data = set(l)
     rows, columns = [], []
 
+<<<<<<< HEAD
     for i in range(len(l)):
 
 
@@ -771,6 +805,15 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
     # 1. Select the top indices from the original model
     lowest_idx = np.argsort(weight_vector)[:n_weights]
     highest_idx = np.argsort(weight_vector)[-n_weights:][::-1]
+=======
+def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None):
+    """Pick the 10 most negative and 10 most positive weighted features,
+    refit on just those 20 features, and return the refit weights together
+    with their indices IN THE ORIGINAL FEATURE SPACE."""
+    plot_weights(weight_vector, trait_name='all_weights', out_dir=out_dir)
+    lowest_idx = np.argsort(weight_vector)[:20]
+    highest_idx = np.argsort(weight_vector)[-20:][::-1]
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
     selected_idx = np.concatenate([lowest_idx, highest_idx])
 
     # 2. Refit the model on just the selected features
@@ -779,8 +822,13 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
 
     # 3. Sort the newly refitted weights to ensure we only keep the top ones
     order = np.argsort(weight_vector_selected)
+<<<<<<< HEAD
     lowest_local = order[:n_weights]
     highest_local = order[-n_weights:][::-1]
+=======
+    lowest_local = order[:20]
+    highest_local = order[-20:][::-1]
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
     final_local = np.concatenate([lowest_local, highest_local])
 
     # 4. Map the final local indices back to the original feature space
@@ -1290,10 +1338,16 @@ def main():
     print(f"K-merization time: {time_kmerization:.2f} seconds")
 
     # 4. Build feature matrix
+<<<<<<< HEAD
     A, index_dict = montaA(sequences)
     reverse_dict = inversa_k(index_dict)
 
 
+=======
+    A = montaA(sequences)
+    scipy.io.savemat(os.path.join(out_dir, "feature_matrix.mat"), {"A": A})
+    np.save(os.path.join(out_dir, "feature_matrix.npy"), A)
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
 
     # 5. SVD / PCA visualization
     time_visualization = time.time()
