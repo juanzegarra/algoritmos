@@ -4,6 +4,8 @@ from collections import defaultdict
 
 FASTA_FILE = "all_uniprot_concat.fasta"
 
+num_threads = 64
+
 # Global references for Copy-on-Write sharing
 seq_lines = []
 list_of_seqs = []
