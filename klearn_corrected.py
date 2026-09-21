@@ -1,4 +1,3 @@
-
 # Paralelismo no bootstrap das árvores FEITO
 # Fazer plot do P(x) ordenado cor diferente para os labels
 # Retornar kmers dos labels FEITO
@@ -54,7 +53,6 @@ import os
 from multiprocessing import Pool
 import multiprocessing as mp
 import time
-from turtle import seth
 
 import numpy as np
 import pandas as pd
@@ -79,8 +77,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, roc_curve, auc
 
 ALPHABET = "ADQIMSYRCGLFTVNEHKPWX"  # last letter (X) is intentionally invalid/unused
 VALID_AA_COUNT = 20  # only the first 20 letters of ALPHABET are valid amino acids
-time_log = f"time_log_{os.getpid()}.txt"
-start_time = time.time()
+DEFAULT_N_WEIGHTS = 20  # top/bottom N features kept per side when reducing weights
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -127,7 +124,7 @@ def parse_args():
     parser.add_argument('--test-size', type=float, default=0.25,
                          help='Fraction of samples held out to test classifier accuracy '
                               '(annotation mode only).')
-    parser.add_argument('--weight-reduction', type=int, default=None,
+    parser.add_argument('--weight_reduction', type=int, default=None,
                          help='Reduce weights by selecting the N top and N lowest most discriminative k-mers.')
     parser.add_argument('--assemble_kmers', action='store_true',
                          help='(Not yet implemented) Assemble discriminative k-mers back into '
@@ -321,20 +318,28 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     s = svd.singular_values_
     sum_s2_total = np.sum(s ** 2)
     n_top = min(3, max_components)
-    plot_svd = plt.figure(figsize=(10, 6))
-    plot_svd.plot(s, 'o-')
-    plot_svd.xlabel('Singular Value Index')
-    plot_svd.ylabel('Singular Value')
-    plot_svd.title('Singular Values')
-    plot_svd.savefig(f'{out_dir}/svd.png')
 
+    # Scree plot of singular values. NOTE: plt.figure() returns a Figure,
+    # which has no .plot()/.xlabel()/.ylabel()/.title() methods -- those
+    # belong to an Axes (or to the pyplot module). Using a proper Axes here
+    # instead of calling those methods on the Figure directly.
+    scree_fig, scree_ax = plt.subplots(figsize=(10, 6))
+    scree_ax.plot(s, 'o-')
+    scree_ax.set_xlabel('Singular Value Index')
+    scree_ax.set_ylabel('Singular Value')
+    scree_ax.set_title('Singular Values')
+    scree_fig.savefig(os.path.join(out_dir, "svd.png"))
+    plt.close(scree_fig)
 
-    if np.cumsum(svd.explained_variance_ratio_)[:n_top].sum() < 0.7:
-        while np.cumsum(svd.explained_variance_ratio_)[:n_top].sum() < 0.7:
-            optimal_visualization = optimal_k - 1
-            svd_optimal = TruncatedSVD(n_components=optimal_visualization, random_state=42)
-            A_k = svd_optimal.fit_transform(A)
-            s = svd_optimal.singular_values_
+    # NOTE: the previous version of this block tried to keep shrinking
+    # `optimal_visualization` in a while loop until the top-n_top variance
+    # ratio reached 0.7, but `optimal_visualization` was recomputed to the
+    # SAME value (optimal_k - 1) on every iteration -- since optimal_k never
+    # changes inside the loop, the loop condition never changes either, so
+    # if it was ever true on entry the script would hang forever. Removed:
+    # `alpha` below already rescales the top-n_top coordinates so their
+    # displayed variance ratio matches `target_variance`, which is the only
+    # thing that block was trying to achieve.
 
     sum_s2_top = np.sum(s[:n_top] ** 2)
     alpha = np.sqrt((target_variance * sum_s2_total) / sum_s2_top) if sum_s2_top > 0 else 1.0
@@ -435,15 +440,21 @@ def fit_linear_classifier(A, indicadores, method='linear'):
         raise ValueError(f"Unknown classifier method: {method}")
 
 # plot the feature weights
-def plot_weights(w, out_dir=None, trait_name='trait'):
-    w = np.sort(w)
-    plt.figure()
-    plt.plot(range(len(w)), w, "*", s=10)
-    plt.xlabel('Feature')
-    plt.ylabel('Weight')
-    plt.title(f'Feature weights for {trait_name}')
-    plt.savefig(os.path.join(out_dir, f'{trait_name}_weights.png'))
-    plt.close()
+def plot_weights(w, out_dir, trait_name='trait'):
+    """Scatter plot of a classifier's per-feature weights, sorted ascending.
+    Saved to out_dir/<trait_name>_weights.png -- pass a distinct
+    `trait_name` per call (e.g. via reduce_weights' `label`), or repeated
+    calls will overwrite each other's plot."""
+    w_sorted = np.sort(w)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(range(len(w_sorted)), w_sorted, marker='*', s=10)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=1)
+    ax.set_xlabel('Feature (sorted by weight)')
+    ax.set_ylabel('Weight')
+    ax.set_title(f'Feature weights — {trait_name}')
+    safe_name = "".join(c if c.isalnum() else "_" for c in trait_name)
+    fig.savefig(os.path.join(out_dir, f'{safe_name}_weights.png'))
+    plt.close(fig)
 
 
 # kept for backwards compatibility with the original function name
@@ -452,38 +463,65 @@ def logistica(A, indicadores):
 
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
-                         test_size=0.25, random_state=42, w=None, weight_reduction=None, k=None):
-    """Train/test split, fit `method` classifier, and save a figure with a
-    confusion matrix and ROC curve to out_dir. Returns test accuracy."""
+                         test_size=0.25, random_state=42, sample_ids=None,
+                         weight_reduction=None, k=None):
+    """Train/test split, fit `method` classifier, and save:
+       - a figure with a confusion matrix and ROC curve
+       - a figure comparing each held-out sequence's model logit/decision
+         score against its true label (see plot_logit_classification)
+       - a .tsv table with per-sequence id/true label/predicted label/logit
+       - if `weight_reduction` is set (an int N) and method='linear', the
+         classifier is refit using only the N most positive and N most
+         negative weighted features, learned on the TRAINING split only (to
+         avoid leaking the held-out test set into feature selection); the
+         selected k-mers are written to the report if `k` is given.
+    Returns test accuracy."""
     indicadores = np.asarray(indicadores)
+    idx_all = np.arange(A.shape[0])
 
     try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            A, indicadores, test_size=test_size, random_state=random_state,
+        idx_train, idx_test = train_test_split(
+            idx_all, test_size=test_size, random_state=random_state,
             stratify=indicadores
         )
     except ValueError:
         # stratification can fail with very few samples per class
-        X_train, X_test, y_train, y_test = train_test_split(
-            A, indicadores, test_size=test_size, random_state=random_state
+        idx_train, idx_test = train_test_split(
+            idx_all, test_size=test_size, random_state=random_state
         )
 
-    kmer_idx, w_red = None, None
+    X_train, X_test = A[idx_train], A[idx_test]
+    y_train, y_test = indicadores[idx_train], indicadores[idx_test]
+    ids_test = ([sample_ids[i] for i in idx_test] if sample_ids is not None
+                else [str(i) for i in idx_test])
+
+    selected_idx = None
     if method == 'linear' and weight_reduction is not None:
-        if w is None:
-            w = fit_linear_classifier(X_train, y_train, method='linear')
-        w_red, kmer_idx = reduce_weights(A, w, indicadores, classifier='linear', out_dir=out_dir)
-        scores_test = X_test @ w_red
+        w = fit_linear_classifier(X_train, y_train, method='linear')
+        # fit AND select features on the training split only -- using the
+        # full A/indicadores here (as an earlier version of this function
+        # did) leaks the held-out test set into feature selection.
+        w_selected, selected_idx = reduce_weights(
+            X_train, w, y_train, classifier='linear', out_dir=out_dir,
+            n_weights=weight_reduction, label=trait_name
+        )
+        scores_test = X_test[:, selected_idx] @ w_selected
         y_pred = np.where(scores_test >= 0, 1, 0)
-    elif not weight_reduction:
+    elif method == 'linear':
         w = fit_linear_classifier(X_train, y_train, method='linear')
         scores_test = X_test @ w
         y_pred = np.where(scores_test >= 0, 1, 0)
     elif method == 'logreg':
+        if weight_reduction is not None:
+            print(f"Note: --weight_reduction only applies to --classifier linear; "
+                  f"ignoring it for trait '{trait_name}' (classifier=logreg).")
         model = LogisticRegression(max_iter=1000)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
-        scores_test = model.predict_proba(X_test)[:, 1]
+        # decision_function is the raw logit (log-odds), threshold at 0 --
+        # same scale/threshold convention as the 'linear' classifier above,
+        # unlike predict_proba which lives in [0, 1] with threshold 0.5.
+        scores_test = model.decision_function(X_test)
     else:
         raise ValueError(f"Unknown classifier method: {method}")
 
@@ -524,17 +562,95 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         f.write(f"Classifier: {method}\n")
         f.write(f"Test accuracy: {accuracy:.4f}\n")
         f.write(f"Confusion matrix:\n{cm}\n")
+        if selected_idx is not None:
+            if k is not None:
+                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
+                f.write(f"Selected k-mers ({len(important_kmers)}): "
+                        f"{', '.join(important_kmers)}\n")
+            else:
+                f.write(f"Selected feature indices ({len(selected_idx)}): "
+                        f"{selected_idx.tolist()} (pass k-mer size to decode as sequences)\n")
 
-        if kmer_idx is not None:
-            f.write(f"Selected k-mers: {inversa((int(kmer_idx) + 1, k))}\n")
+    plot_logit_classification(ids_test, y_test, scores_test, y_pred, out_dir, trait_name)
+
     return accuracy
 
 
-def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None, n_weights=20):
-    """Pick the 10 most negative and 10 most positive weighted features,
-    refit on just those 20 features, and return the refit weights together
-    with their indices IN THE ORIGINAL FEATURE SPACE."""
-    plot_weights(weight_vector, trait_name='all_weights', out_dir=out_dir)
+def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name):
+    """Compare each sequence's model logit/decision score against its true
+    label: one point per sequence, x = logit, y = sequences sorted by logit.
+    Points are colored by the TRUE label; correctly classified sequences are
+    filled circles, misclassified ones are 'x' markers. A dashed line marks
+    the decision threshold (logit = 0). Also writes a .tsv table with one
+    row per sequence (id, true label, predicted label, logit) for
+    programmatic inspection or use in other plotting tools.
+
+    Works for both classifiers: for 'linear' the score is A @ w; for
+    'logreg' it is model.decision_function(A) (the raw log-odds) -- both use
+    0 as the decision threshold, unlike predict_proba which uses 0.5."""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    scores = np.asarray(scores)
+    sample_ids = list(sample_ids)
+
+    order = np.argsort(scores)
+    sorted_scores = scores[order]
+    sorted_true = y_true[order]
+    sorted_pred = y_pred[order]
+    sorted_ids = [sample_ids[i] for i in order]
+    correct = sorted_true == sorted_pred
+
+    fig_height = max(4, len(sorted_scores) * 0.28)
+    fig, ax = plt.subplots(figsize=(10, fig_height))
+    y_positions = np.arange(len(sorted_scores))
+
+    classes = sorted(set(y_true.tolist()))
+    palette = {classes[0]: 'tab:blue', classes[-1]: 'tab:orange'} if len(classes) > 1 \
+        else {classes[0]: 'tab:blue'}
+
+    for cls, color in palette.items():
+        mask = sorted_true == cls
+        ax.scatter(sorted_scores[mask & correct], y_positions[mask & correct],
+                   color=color, marker='o', s=45,
+                   label=f'true label {int(cls)} — correctly classified')
+        ax.scatter(sorted_scores[mask & ~correct], y_positions[mask & ~correct],
+                   color=color, marker='x', linewidths=2,
+                   s=70, label=f'true label {int(cls)} — misclassified')
+
+    ax.axvline(0, color='gray', linestyle='--', linewidth=1, label='decision threshold')
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(sorted_ids, fontsize=7)
+    ax.set_xlabel('Model logit / decision score')
+    ax.set_title(f'{trait_name} — sequence classification vs. true label')
+    ax.legend(loc='best', fontsize=8)
+    plt.tight_layout()
+
+    safe_name = "".join(c if c.isalnum() else "_" for c in trait_name)
+    fig_path = os.path.join(out_dir, f"logit_classification_{safe_name}.png")
+    plt.savefig(fig_path, dpi=150)
+    plt.close(fig)
+
+    table_path = os.path.join(out_dir, f"logit_classification_{safe_name}.tsv")
+    with open(table_path, "w") as f:
+        f.write("sequence_id\ttrue_label\tpredicted_label\tlogit\n")
+        for sid, t, p, s in zip(sorted_ids, sorted_true, sorted_pred, sorted_scores):
+            f.write(f"{sid}\t{int(t)}\t{int(p)}\t{s:.4f}\n")
+
+    return fig_path, table_path
+
+
+def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None,
+                    n_weights=DEFAULT_N_WEIGHTS, label='weights'):
+    """Pick the `n_weights` most negative and `n_weights` most positive
+    weighted features, refit on just those 2*n_weights features, and return
+    the refit weights together with their indices IN THE ORIGINAL FEATURE
+    SPACE. If `out_dir` is given, also saves two weight plots (before and
+    after the refit) named from `label` -- pass a distinct string `label`
+    per call (e.g. the trait name or a tree node's name), or repeated calls
+    will overwrite each other's plots."""
+    if out_dir is not None:
+        plot_weights(weight_vector, out_dir, trait_name=f'{label}_all')
+
     lowest_idx = np.argsort(weight_vector)[:n_weights]
     highest_idx = np.argsort(weight_vector)[-n_weights:][::-1]
     selected_idx = np.concatenate([lowest_idx, highest_idx])
@@ -548,7 +664,8 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
     final_local = np.concatenate([lowest_local, highest_local])
 
     final_original_idx = selected_idx[final_local]
-    plot_weights(weight_vector_selected[final_local], trait_name='selected_weights', out_dir=out_dir)
+    if out_dir is not None:
+        plot_weights(weight_vector_selected[final_local], out_dir, trait_name=f'{label}_selected')
     return weight_vector_selected[final_local], final_original_idx
 
 
@@ -585,12 +702,18 @@ def initialize_bootstrap(A, sample_labels):
     global_A = A
     global_labels = sample_labels
 
-def run_single_bootstrap(A, sample_labels):
-    np.random.seed()
-    feature_idx = np.random.choice(A.shape[1], A.shape[1], replace=True)
-    A_bootstrap = A[:, feature_idx]
-    tree = neighbor_join_reduced(A_bootstrap, sample_labels)
-    return tree
+def run_single_bootstrap(seed):
+    """Runs inside a worker process. Reads the feature matrix and sample
+    labels from the globals set by `initialize_bootstrap` (via the Pool
+    initializer) instead of receiving them as arguments, so only the small
+    `seed` integer needs to be pickled per task -- not the whole matrix."""
+    global global_A, global_labels
+    rng = np.random.RandomState(seed)
+    n_features = global_A.shape[1]
+    feature_idx = rng.choice(n_features, n_features, replace=True)
+    A_bootstrap = global_A[:, feature_idx]
+    return neighbor_join_reduced(A_bootstrap, global_labels)
+
 
 def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir, processes=None):
     """Standard (Felsenstein) non-parametric bootstrap: resample k-mer
@@ -604,27 +727,26 @@ def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir, processes=None):
     sample_labels = [s.id for s in sequences]
     n_features = A.shape[1]
 
-    if not processes:
+    if not processes or processes <= 1 or n_bootstrap <= 1:
         for _ in range(n_bootstrap):
             feature_idx = np.random.choice(n_features, n_features, replace=True)
             A_bootstrap = A[:, feature_idx]
             tree = neighbor_join_reduced(A_bootstrap, sample_labels)
             trees.append(tree)
     else:
-        initialize_bootstrap(A, sample_labels)
-        if __name__ == "__main__":
-            n_features = A.shape[1]
-            seeds = np.random.randint(0, 2**32 - 1, size=n_bootstrap)
+        n_workers = min(processes, mp.cpu_count(), n_bootstrap)
+        seeds = np.random.randint(0, 2 ** 32 - 1, size=n_bootstrap).tolist()
 
-            # Pass A and sample_labels ONCE per worker process via initializer
-            with mp.Pool(
-                processes=processes if mp.cpu_count() >= processes else mp.cpu_count(),
-                initializer=initialize_bootstrap,
-                initargs=(A, sample_labels),
-            )
-            as pool:
-                # Only small lightweight arguments are passed per iteration
-                trees = pool.starmap(run_single_bootstrap, [(s, n_features) for s in seeds])
+        # A and sample_labels are sent to each worker ONCE via the Pool
+        # initializer; each task then only pickles its small seed integer
+        # (see run_single_bootstrap, which reads them back from the globals
+        # the initializer sets INSIDE each worker process).
+        with mp.Pool(
+            processes=n_workers,
+            initializer=initialize_bootstrap,
+            initargs=(A, sample_labels),
+        ) as pool:
+            trees = pool.map(run_single_bootstrap, seeds)
 
     consensus_tree = majority_consensus(trees, cutoff=tree_cutoff)
     consensus_tree.root.confidence = None
@@ -637,18 +759,28 @@ def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir, processes=None):
 
     return consensus_tree
 
-def init_classifier_labels(labels, A):
-    global classifier_labels
-    classifier_labels = labels
-    global A_global
-    A_global = A
+def init_classifier_worker(A, classifier_method):
+    global classifier_A, classifier_method_global
+    classifier_A = A
+    classifier_method_global = classifier_method
 
 
-def classify_internal_nodes(tree, A, sequences, classifier='linear'):
+def fit_node_classifier_worker(vector):
+    """Runs inside a worker process; reads A and the classifier method from
+    the globals set by init_classifier_worker (via the Pool initializer)."""
+    global classifier_A, classifier_method_global
+    return fit_linear_classifier(classifier_A, vector, method=classifier_method_global)
+
+
+def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1):
     """For every internal node (clade) of `tree`, build a 0/1 indicator
     vector over samples (1 = descendant of that clade) and fit a linear
     classifier against the k-mer feature matrix `A`. Returns
-    (weight_dict, label_dict) both keyed by clade object."""
+    (weight_dict, label_dict) both keyed by clade object.
+
+    If `processes` > 1, one classifier is fit per node in parallel (the
+    feature matrix `A` is sent to each worker once via the Pool
+    initializer, rather than once per node)."""
     id_to_row = {seq.id: i for i, seq in enumerate(sequences)}
 
     labels = {}
@@ -660,10 +792,18 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear'):
                 vector[row] = 1.0
         labels[node] = vector
 
-    with mp.Pool(mp.cpu_count(), initializer=init_classifier_labels, initargs=(labels, A)) as pool:
-        node_weight_list = pool.starmap(fit_linear_classifier, [(node, vector, classifier) for node, vector in labels.items()])
+    nodes = list(labels.keys())
+    vectors = [labels[node] for node in nodes]
 
-    weight_dict = {node: weight for node, weight in zip(labels.keys(), node_weight_list)}
+    if processes and processes > 1 and len(nodes) > 1:
+        n_workers = min(processes, mp.cpu_count(), len(nodes))
+        with mp.Pool(n_workers, initializer=init_classifier_worker,
+                     initargs=(A, classifier)) as pool:
+            weight_list = pool.map(fit_node_classifier_worker, vectors)
+    else:
+        weight_list = [fit_linear_classifier(A, vector, method=classifier) for vector in vectors]
+
+    weight_dict = dict(zip(nodes, weight_list))
 
     return weight_dict, labels
 
@@ -688,6 +828,7 @@ def assemble_kmers(important_kmers, sequences, k):
 # ---------------------------------------------------------------------------
 
 def main():
+    start_time = time.time()
     time_nodes = 0
     time_tree = 0
     time_kmerization = 0
@@ -708,11 +849,13 @@ def main():
 
     out_dir = args.outdir
     os.makedirs(out_dir, exist_ok=True)
+    time_log_path = os.path.join(out_dir, f"time_log_{os.getpid()}.txt")
 
     k = args.kmer
     processes = args.processes
     classifier_method = args.classifier
     test_size = args.test_size
+    weight_reduction = args.weight_reduction
 
     # 1. Read sequences
     sequences = read_fasta(args.fasta)
@@ -736,7 +879,7 @@ def main():
         annotation_matrix = create_annotation_vector(sequences)
 
     # 3. K-merize (parallel or sequential)
-    kmerization_time = time.time()
+    time_kmerization = time.time()
 
     if k > 4:
         print(f"Note: k={k} means a {VALID_AA_COUNT**k:,}-dimensional feature vector per "
@@ -752,8 +895,8 @@ def main():
         seq.kmer_vector = vector
         for window in invalid:
             print(f"Warning: invalid character in kmer of {seq.id}: {window}")
-    kmerization_time = time.time() - kmerization_time
-    print(f"K-merization time: {kmerization_time:.2f} seconds")
+    time_kmerization = time.time() - time_kmerization
+    print(f"K-merization time: {time_kmerization:.2f} seconds")
 
     # 4. Build feature matrix
     A = montaA(sequences)
@@ -761,7 +904,7 @@ def main():
     np.save(os.path.join(out_dir, "feature_matrix.npy"), A)
 
     # 5. SVD / PCA visualization
-    visualization_time = time.time()
+    time_visualization = time.time()
     color_labels = annotation_matrix[:, 0] if annotation_matrix is not None else None
     A_reduced, A_k, optimal_k = singular(A, out_dir, labels=color_labels)
     np.save(os.path.join(out_dir, "A_reduced.npy"), A_reduced)
@@ -769,25 +912,26 @@ def main():
 
     # 6. Unsupervised clustering as a visual sanity check
     run_kmeans(A_reduced, optimal_k, out_dir)
-    visualization_time = time.time() - visualization_time
-    print(f"Visualization time: {visualization_time:.2f} seconds")
+    time_visualization = time.time() - time_visualization
+    print(f"Visualization time: {time_visualization:.2f} seconds")
 
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
-        with open(os.path.join(out_dir, "important_kmers_annotation.txt"), "w") as f:
-            for t_idx, trait_name in enumerate(trait_names):
-                y = annotation_matrix[:, t_idx]
-                if len(np.unique(y)) < 2:
-                    print(f"Skipping trait '{trait_name}': only one class present.")
-                    continue
-                acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
-                                           method=classifier_method, test_size=test_size)
-                print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
+        for t_idx, trait_name in enumerate(trait_names):
+            y = annotation_matrix[:, t_idx]
+            if len(np.unique(y)) < 2:
+                print(f"Skipping trait '{trait_name}': only one class present.")
+                continue
+            acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
+                                       method=classifier_method, test_size=test_size,
+                                       sample_ids=[s.id for s in sequences],
+                                       weight_reduction=weight_reduction, k=k)
+            print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
 
     # 8. Phylogenetics
     tree = None
     if tree_mode:
-        tree_time = time.time()
+        time_tree = time.time()
         sample_labels = [seq.id for seq in sequences]
         if args.bootstraps == 0:
             tree = neighbor_join_reduced(A, sample_labels)
@@ -797,23 +941,26 @@ def main():
             plt.savefig(os.path.join(out_dir, "tree_image.png"), dpi=300, bbox_inches="tight")
             plt.close(fig)
         else:
-            tree = bootstrap(A, args.bootstraps, sequences, args.tree_cutoff, out_dir)
-        tree_time = time.time() - tree_time
-        print(f"Phylogenetic tree construction time: {tree_time:.2f} seconds")
+            tree = bootstrap(A, args.bootstraps, sequences, args.tree_cutoff, out_dir, processes=processes)
+        time_tree = time.time() - time_tree
+        print(f"Phylogenetic tree construction time: {time_tree:.2f} seconds")
 
     # 9. Tree-based internal node classification (annotation-free)
     if args.classify_nodes:
         time_nodes = time.time()
         weight_dict, label_arrays = classify_internal_nodes(
-            tree, A, sequences, classifier=classifier_method
+            tree, A, sequences, classifier=classifier_method, processes=processes
         )
         report_path = os.path.join(out_dir, "node_classification.txt")
         with open(report_path, "w") as f:
             for node, w in weight_dict.items():
                 indicadores = label_arrays[node]
-                _, selected_idx = reduce_weights(A, w, indicadores, classifier=classifier_method, out_dir=out_dir)
-                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
                 node_label = node.name if node.name else f"node_{id(node)}"
+                _, selected_idx = reduce_weights(
+                    A, w, indicadores, classifier=classifier_method, out_dir=out_dir,
+                    n_weights=weight_reduction or DEFAULT_N_WEIGHTS, label=node_label
+                )
+                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
                 f.write(f"{node_label}\t{','.join(important_kmers)}\n")
         time_nodes = time.time() - time_nodes
         print(f"Internal node classification time: {time_nodes:.2f} seconds")
@@ -825,11 +972,12 @@ def main():
 
     print(f"Done. Results written to {out_dir}")
 
-    with open(time_log, "a") as f:
+    with open(time_log_path, "a") as f:
         f.write(f"total time\t{time.time() - start_time}\n")
-        f.write(f"k-merization time\t{kmerization_time:.2f} seconds\n")
-        f.write(f"visualization time\t{visualization_time:.2f} seconds\n")
-        f.write(f"tree time\t{tree_time:.2f} seconds\n")
+        f.write(f"k-merization time\t{time_kmerization:.2f} seconds\n")
+        f.write(f"visualization time\t{time_visualization:.2f} seconds\n")
+        if tree_mode:
+            f.write(f"tree time\t{time_tree:.2f} seconds\n")
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
 
