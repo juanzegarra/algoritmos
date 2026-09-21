@@ -1,9 +1,19 @@
-# Implementar paralelismo no classificador dos nós
-# Paralelismo no bootstrap das árvores
+
+# Paralelismo no bootstrap das árvores FEITO
 # Fazer plot do P(x) ordenado cor diferente para os labels
-# Aumentar numero de kmers para classificação
-# Retornar kmers dos labels
+# Retornar kmers dos labels FEITO
 # Kmer = 4
+# kmeans com valor de K cumsum=0.9 FEITO
+# cumsum=0.9 usar o aux de 0.9 para consturir arvore FEITO
+# plotar pesos da regressão FEITO
+# fazer arvore com alinhamento multiplo e neighbor-joining FEITO
+# Implementar paralelismo no classificador dos nós
+# Paralelismo no bootstrap das árvores FEITO
+# Fazer plot do P(x) ordenado cor diferente para os labels
+# Aumentar numero de kmers para classificação FEITO (adicionei flag para dar entrada no número de kmers desejados)
+# Retornar kmers dos labels FEITO
+# Kmer = 4
+# Comparar filogenia com filogenia classica
 
 """
 klearn.py
@@ -42,6 +52,7 @@ Steps:
 import argparse
 import os
 from multiprocessing import Pool
+import multiprocessing as mp
 import time
 from turtle import seth
 
@@ -116,12 +127,20 @@ def parse_args():
     parser.add_argument('--test-size', type=float, default=0.25,
                          help='Fraction of samples held out to test classifier accuracy '
                               '(annotation mode only).')
+    parser.add_argument('--weight-reduction', type=int, default=None,
+                         help='Reduce weights by selecting the N top and N lowest most discriminative k-mers.')
     parser.add_argument('--assemble_kmers', action='store_true',
                          help='(Not yet implemented) Assemble discriminative k-mers back into '
                               'contigs.')
 
     return parser.parse_args()
 
+# ---------------------------------------------------------------------------
+#  Global variables for shared multiprocessing memory
+# ---------------------------------------------------------------------------
+
+global_A = None
+global_labels = None
 
 # ---------------------------------------------------------------------------
 # k-mer <-> integer address encoding (generalized to arbitrary k)
@@ -302,12 +321,12 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     s = svd.singular_values_
     sum_s2_total = np.sum(s ** 2)
     n_top = min(3, max_components)
-    plot_svds = plt.figure(figsize=(10, 6))
-    plt.plot(s, 'o-')
-    plt.xlabel('Singular Value Index')
-    plt.ylabel('Singular Value')
-    plt.title('Singular Values')
-    plt.show()
+    plot_svd = plt.figure(figsize=(10, 6))
+    plot_svd.plot(s, 'o-')
+    plot_svd.xlabel('Singular Value Index')
+    plot_svd.ylabel('Singular Value')
+    plot_svd.title('Singular Values')
+    plot_svd.savefig(f'{out_dir}/svd.png')
 
 
     if np.cumsum(svd.explained_variance_ratio_)[:n_top].sum() < 0.7:
@@ -431,10 +450,9 @@ def plot_weights(w, out_dir=None, trait_name='trait'):
 def logistica(A, indicadores):
     return fit_linear_classifier(A, indicadores, method='linear')
 
-
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
-                         test_size=0.25, random_state=42, w=None):
+                         test_size=0.25, random_state=42, w=None, weight_reduction=None, k=None):
     """Train/test split, fit `method` classifier, and save a figure with a
     confusion matrix and ROC curve to out_dir. Returns test accuracy."""
     indicadores = np.asarray(indicadores)
@@ -450,11 +468,16 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             A, indicadores, test_size=test_size, random_state=random_state
         )
 
-    if method == 'linear':
+    kmer_idx, w_red = None, None
+    if method == 'linear' and weight_reduction is not None:
         if w is None:
             w = fit_linear_classifier(X_train, y_train, method='linear')
         w_red, kmer_idx = reduce_weights(A, w, indicadores, classifier='linear', out_dir=out_dir)
         scores_test = X_test @ w_red
+        y_pred = np.where(scores_test >= 0, 1, 0)
+    elif not weight_reduction:
+        w = fit_linear_classifier(X_train, y_train, method='linear')
+        scores_test = X_test @ w
         y_pred = np.where(scores_test >= 0, 1, 0)
     elif method == 'logreg':
         model = LogisticRegression(max_iter=1000)
@@ -502,24 +525,26 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         f.write(f"Test accuracy: {accuracy:.4f}\n")
         f.write(f"Confusion matrix:\n{cm}\n")
 
+        if kmer_idx is not None:
+            f.write(f"Selected k-mers: {inversa((int(kmer_idx) + 1, k))}\n")
     return accuracy
 
 
-def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None):
+def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None, n_weights=20):
     """Pick the 10 most negative and 10 most positive weighted features,
     refit on just those 20 features, and return the refit weights together
     with their indices IN THE ORIGINAL FEATURE SPACE."""
     plot_weights(weight_vector, trait_name='all_weights', out_dir=out_dir)
-    lowest_idx = np.argsort(weight_vector)[:20]
-    highest_idx = np.argsort(weight_vector)[-20:][::-1]
+    lowest_idx = np.argsort(weight_vector)[:n_weights]
+    highest_idx = np.argsort(weight_vector)[-n_weights:][::-1]
     selected_idx = np.concatenate([lowest_idx, highest_idx])
 
     A_selected = A[:, selected_idx]
     weight_vector_selected = fit_linear_classifier(A_selected, indicadores, method=classifier)
 
     order = np.argsort(weight_vector_selected)
-    lowest_local = order[:20]
-    highest_local = order[-20:][::-1]
+    lowest_local = order[:n_weights]
+    highest_local = order[-n_weights:][::-1]
     final_local = np.concatenate([lowest_local, highest_local])
 
     final_original_idx = selected_idx[final_local]
@@ -554,8 +579,20 @@ def neighbor_join_reduced(A, sample_labels, target_variance=0.90):
     tree = constructor.nj(bio_dm)
     return tree
 
+def initialize_bootstrap(A, sample_labels):
+    global global_A
+    global global_labels
+    global_A = A
+    global_labels = sample_labels
 
-def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir):
+def run_single_bootstrap(A, sample_labels):
+    np.random.seed()
+    feature_idx = np.random.choice(A.shape[1], A.shape[1], replace=True)
+    A_bootstrap = A[:, feature_idx]
+    tree = neighbor_join_reduced(A_bootstrap, sample_labels)
+    return tree
+
+def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir, processes=None):
     """Standard (Felsenstein) non-parametric bootstrap: resample k-mer
     FEATURES (columns) with replacement while keeping every sample/taxon
     fixed, so the same set of unique tip labels is used to build every
@@ -567,11 +604,27 @@ def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir):
     sample_labels = [s.id for s in sequences]
     n_features = A.shape[1]
 
-    for _ in range(n_bootstrap):
-        feature_idx = np.random.choice(n_features, n_features, replace=True)
-        A_bootstrap = A[:, feature_idx]
-        tree = neighbor_join_reduced(A_bootstrap, sample_labels)
-        trees.append(tree)
+    if not processes:
+        for _ in range(n_bootstrap):
+            feature_idx = np.random.choice(n_features, n_features, replace=True)
+            A_bootstrap = A[:, feature_idx]
+            tree = neighbor_join_reduced(A_bootstrap, sample_labels)
+            trees.append(tree)
+    else:
+        initialize_bootstrap(A, sample_labels)
+        if __name__ == "__main__":
+            n_features = A.shape[1]
+            seeds = np.random.randint(0, 2**32 - 1, size=n_bootstrap)
+
+            # Pass A and sample_labels ONCE per worker process via initializer
+            with mp.Pool(
+                processes=processes if mp.cpu_count() >= processes else mp.cpu_count(),
+                initializer=initialize_bootstrap,
+                initargs=(A, sample_labels),
+            )
+            as pool:
+                # Only small lightweight arguments are passed per iteration
+                trees = pool.starmap(run_single_bootstrap, [(s, n_features) for s in seeds])
 
     consensus_tree = majority_consensus(trees, cutoff=tree_cutoff)
     consensus_tree.root.confidence = None
@@ -583,6 +636,12 @@ def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir):
     Phylo.write(consensus_tree, os.path.join(out_dir, "majority_consensus_tree.nwk"), "newick")
 
     return consensus_tree
+
+def init_classifier_labels(labels, A):
+    global classifier_labels
+    classifier_labels = labels
+    global A_global
+    A_global = A
 
 
 def classify_internal_nodes(tree, A, sequences, classifier='linear'):
@@ -601,10 +660,10 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear'):
                 vector[row] = 1.0
         labels[node] = vector
 
-    weight_dict = {
-        node: fit_linear_classifier(A, vector, method=classifier)
-        for node, vector in labels.items()
-    }
+    with mp.Pool(mp.cpu_count(), initializer=init_classifier_labels, initargs=(labels, A)) as pool:
+        node_weight_list = pool.starmap(fit_linear_classifier, [(node, vector, classifier) for node, vector in labels.items()])
+
+    weight_dict = {node: weight for node, weight in zip(labels.keys(), node_weight_list)}
 
     return weight_dict, labels
 
