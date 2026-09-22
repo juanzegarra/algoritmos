@@ -13,6 +13,12 @@
 # Retornar kmers dos labels FEITO
 # Kmer = 4
 # Comparar filogenia com filogenia classica
+# Tentar colocar como esparsa a matriz de features ao inves de inicializar como zero 
+# Cortar os features não importantes para fazer bootstrapping, não selecionar da matriz completa de features. 
+# Criar função para selecionar threasholds
+# fazer montagem 
+# tentar achar estrutura 
+# Tentar debuggar quitapleta 
 
 """
 klearn.py
@@ -53,6 +59,8 @@ import os
 from multiprocessing import Pool
 import multiprocessing as mp
 import time
+from collections import defaultdict
+
 
 import numpy as np
 import pandas as pd
@@ -97,7 +105,8 @@ def parse_args():
                               'and first column as sequence ID. Each remaining column is a '
                               'trait and must be labeled as 0s or 1s. Multiple trait columns '
                               'are supported. If omitted, use --phylo with --classify_nodes '
-                              'for annotation-free, tree-based node classification.')
+                              'for annotation-free, tree-based node classification.'
+                              'Column with name Display is used for labelling figures in output plots.')
     parser.add_argument('--phylo', action='store_true',
                          help='Build a phylogenetic tree from sequence k-mer distances.')
     parser.add_argument('--bootstraps', '-b', type=int, default=0,
@@ -111,7 +120,7 @@ def parse_args():
     parser.add_argument('--outdir', '-o', type=str, default='klearn_output',
                          help='Output directory.')
     parser.add_argument('--tree-cutoff', type=float, default=0.8,
-                         help='Consensus cutoff for the bootstrap majority-rule tree.')
+                         help='Consensus cutoff for the bootstrap majority-rule tree. (default = 0.8)')
     parser.add_argument('--classify_nodes', action='store_true',
                          help='Classify internal tree nodes (clades) using k-mer features. '
                               'Requires --phylo. Does not require --anno.')
@@ -138,6 +147,7 @@ def parse_args():
 
 global_A = None
 global_labels = None
+display = None
 
 # ---------------------------------------------------------------------------
 # k-mer <-> integer address encoding (generalized to arbitrary k)
@@ -196,6 +206,7 @@ class seqObject:
         self.seq = seq
         self.kmer_vector = None
         self.anno = None  # list of floats, one per trait; set by read_annotations
+        self.display_name = None
 
     def kmerize(self, k):
         vector, invalid = kmerize_sequence(self.seq, k)
@@ -235,10 +246,14 @@ def read_fasta(fasta_file):
 def read_annotations(anno_file, sequences):
     """Read a tab-separated annotation file (first column = sequence ID,
     remaining columns = 0/1 trait labels) and attach `.anno` (list of floats)
-    to every matching seqObject in `sequences`. Returns the list of trait
-    (column) names."""
+    and `.display_name` to every matching seqObject in `sequences`."""
     df = pd.read_csv(anno_file, sep='\t', index_col=0, dtype=str)
     trait_names = list(df.columns)
+
+    # Isolate and ignore Display column for trait training
+    has_display = "Display" in trait_names
+    if has_display:
+        trait_names.remove("Display")
 
     seq_by_id = {s.id: s for s in sequences}
     found_ids = set()
@@ -248,11 +263,17 @@ def read_annotations(anno_file, sequences):
         if seq_id not in seq_by_id:
             print(f"Warning: annotation for unknown sequence ID '{seq_id}' ignored.")
             continue
+
+        if has_display and pd.notna(row.get("Display")):
+            seq_by_id[seq_id].display_name = str(row["Display"])
+
         try:
-            values = [float(v) for v in row.tolist()]
+            # Extract float values only for actual traits, ignoring 'Display'
+            values = [float(row[col]) for col in trait_names]
         except (ValueError, TypeError):
             print(f"Warning: non-numeric annotation value for '{seq_id}', skipping.")
             continue
+
         seq_by_id[seq_id].anno = values
         found_ids.add(seq_id)
 
@@ -264,7 +285,6 @@ def read_annotations(anno_file, sequences):
               f"{preview}{suffix}")
 
     return trait_names
-
 
 def create_annotation_vector(sequences):
     """Build an (n_samples, n_traits) matrix from each sequence's `.anno`."""
@@ -318,28 +338,15 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     s = svd.singular_values_
     sum_s2_total = np.sum(s ** 2)
     n_top = min(3, max_components)
+    explained_variance = np.sort(svd.explained_variance_ratio_)
 
-    # Scree plot of singular values. NOTE: plt.figure() returns a Figure,
-    # which has no .plot()/.xlabel()/.ylabel()/.title() methods -- those
-    # belong to an Axes (or to the pyplot module). Using a proper Axes here
-    # instead of calling those methods on the Figure directly.
     scree_fig, scree_ax = plt.subplots(figsize=(10, 6))
-    scree_ax.plot(s, 'o-')
+    scree_ax.plot(explained_variance, 'o-')
     scree_ax.set_xlabel('Singular Value Index')
     scree_ax.set_ylabel('Singular Value')
     scree_ax.set_title('Singular Values')
     scree_fig.savefig(os.path.join(out_dir, "svd.png"))
     plt.close(scree_fig)
-
-    # NOTE: the previous version of this block tried to keep shrinking
-    # `optimal_visualization` in a while loop until the top-n_top variance
-    # ratio reached 0.7, but `optimal_visualization` was recomputed to the
-    # SAME value (optimal_k - 1) on every iteration -- since optimal_k never
-    # changes inside the loop, the loop condition never changes either, so
-    # if it was ever true on entry the script would hang forever. Removed:
-    # `alpha` below already rescales the top-n_top coordinates so their
-    # displayed variance ratio matches `target_variance`, which is the only
-    # thing that block was trying to achieve.
 
     sum_s2_top = np.sum(s[:n_top] ** 2)
     alpha = np.sqrt((target_variance * sum_s2_total) / sum_s2_top) if sum_s2_top > 0 else 1.0
@@ -465,17 +472,6 @@ def logistica(A, indicadores):
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
                          test_size=0.25, random_state=42, sample_ids=None,
                          weight_reduction=None, k=None):
-    """Train/test split, fit `method` classifier, and save:
-       - a figure with a confusion matrix and ROC curve
-       - a figure comparing each held-out sequence's model logit/decision
-         score against its true label (see plot_logit_classification)
-       - a .tsv table with per-sequence id/true label/predicted label/logit
-       - if `weight_reduction` is set (an int N) and method='linear', the
-         classifier is refit using only the N most positive and N most
-         negative weighted features, learned on the TRAINING split only (to
-         avoid leaking the held-out test set into feature selection); the
-         selected k-mers are written to the report if `k` is given.
-    Returns test accuracy."""
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
 
@@ -485,48 +481,68 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             stratify=indicadores
         )
     except ValueError:
-        # stratification can fail with very few samples per class
         idx_train, idx_test = train_test_split(
             idx_all, test_size=test_size, random_state=random_state
         )
 
     X_train, X_test = A[idx_train], A[idx_test]
     y_train, y_test = indicadores[idx_train], indicadores[idx_test]
+
     ids_test = ([sample_ids[i] for i in idx_test] if sample_ids is not None
                 else [str(i) for i in idx_test])
+    ids_all = sample_ids if sample_ids is not None else [str(i) for i in range(A.shape[0])]
 
     selected_idx = None
+
+    # Helper to convert raw logits to probabilities [0, 1]
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
     if method == 'linear' and weight_reduction is not None:
         w = fit_linear_classifier(X_train, y_train, method='linear')
-        # fit AND select features on the training split only -- using the
-        # full A/indicadores here (as an earlier version of this function
-        # did) leaks the held-out test set into feature selection.
         w_selected, selected_idx = reduce_weights(
             X_train, w, y_train, classifier='linear', out_dir=out_dir,
             n_weights=weight_reduction, label=trait_name
         )
-        scores_test = X_test[:, selected_idx] @ w_selected
-        y_pred = np.where(scores_test >= 0, 1, 0)
+
+        # Test set predictions
+        scores_test = sigmoid(X_test[:, selected_idx] @ w_selected)
+        y_pred_test = np.where(scores_test >= 0.5, 1, 0)
+
+        # All data predictions
+        scores_all = sigmoid(A[:, selected_idx] @ w_selected)
+        y_pred_all = np.where(scores_all >= 0.5, 1, 0)
+
     elif method == 'linear':
         w = fit_linear_classifier(X_train, y_train, method='linear')
-        scores_test = X_test @ w
-        y_pred = np.where(scores_test >= 0, 1, 0)
+
+        # Test set predictions
+        scores_test = sigmoid(X_test @ w)
+        y_pred_test = np.where(scores_test >= 0.5, 1, 0)
+
+        # All data predictions
+        scores_all = sigmoid(A @ w)
+        y_pred_all = np.where(scores_all >= 0.5, 1, 0)
+
     elif method == 'logreg':
         if weight_reduction is not None:
             print(f"Note: --weight_reduction only applies to --classifier linear; "
                   f"ignoring it for trait '{trait_name}' (classifier=logreg).")
         model = LogisticRegression(max_iter=1000)
         model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        # decision_function is the raw logit (log-odds), threshold at 0 --
-        # same scale/threshold convention as the 'linear' classifier above,
-        # unlike predict_proba which lives in [0, 1] with threshold 0.5.
-        scores_test = model.decision_function(X_test)
+
+        # Test set predictions
+        y_pred_test = model.predict(X_test)
+        scores_test = model.predict_proba(X_test)[:, 1]
+
+        # All data predictions
+        y_pred_all = model.predict(A)
+        scores_all = model.predict_proba(A)[:, 1]
     else:
         raise ValueError(f"Unknown classifier method: {method}")
 
-    accuracy = accuracy_score(y_test, y_pred)
-    cm = confusion_matrix(y_test, y_pred)
+    accuracy = accuracy_score(y_test, y_pred_test)
+    cm = confusion_matrix(y_test, y_pred_test)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -571,23 +587,13 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                 f.write(f"Selected feature indices ({len(selected_idx)}): "
                         f"{selected_idx.tolist()} (pass k-mer size to decode as sequences)\n")
 
-    plot_logit_classification(ids_test, y_test, scores_test, y_pred, out_dir, trait_name)
+    # Generate two plots: one strictly for the test partition, one for the whole dataset
+    plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test")
+    plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all")
 
     return accuracy
 
-
 def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name):
-    """Compare each sequence's model logit/decision score against its true
-    label: one point per sequence, x = logit, y = sequences sorted by logit.
-    Points are colored by the TRUE label; correctly classified sequences are
-    filled circles, misclassified ones are 'x' markers. A dashed line marks
-    the decision threshold (logit = 0). Also writes a .tsv table with one
-    row per sequence (id, true label, predicted label, logit) for
-    programmatic inspection or use in other plotting tools.
-
-    Works for both classifiers: for 'linear' the score is A @ w; for
-    'logreg' it is model.decision_function(A) (the raw log-odds) -- both use
-    0 as the decision threshold, unlike predict_proba which uses 0.5."""
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     scores = np.asarray(scores)
@@ -617,27 +623,27 @@ def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait
                    color=color, marker='x', linewidths=2,
                    s=70, label=f'true label {int(cls)} — misclassified')
 
-    ax.axvline(0, color='gray', linestyle='--', linewidth=1, label='decision threshold')
+    # Threshold updated to 0.5 for probability bounds
+    ax.axvline(0.5, color='gray', linestyle='--', linewidth=1, label='decision threshold (0.5)')
     ax.set_yticks(y_positions)
     ax.set_yticklabels(sorted_ids, fontsize=7)
-    ax.set_xlabel('Model logit / decision score')
+    ax.set_xlabel('Predicted Probability')
     ax.set_title(f'{trait_name} — sequence classification vs. true label')
     ax.legend(loc='best', fontsize=8)
     plt.tight_layout()
 
     safe_name = "".join(c if c.isalnum() else "_" for c in trait_name)
-    fig_path = os.path.join(out_dir, f"logit_classification_{safe_name}.png")
+    fig_path = os.path.join(out_dir, f"probability_classification_{safe_name}.png")
     plt.savefig(fig_path, dpi=150)
     plt.close(fig)
 
-    table_path = os.path.join(out_dir, f"logit_classification_{safe_name}.tsv")
+    table_path = os.path.join(out_dir, f"probability_classification_{safe_name}.tsv")
     with open(table_path, "w") as f:
-        f.write("sequence_id\ttrue_label\tpredicted_label\tlogit\n")
+        f.write("sequence_id\ttrue_label\tpredicted_label\tprobability\n")
         for sid, t, p, s in zip(sorted_ids, sorted_true, sorted_pred, sorted_scores):
             f.write(f"{sid}\t{int(t)}\t{int(p)}\t{s:.4f}\n")
 
     return fig_path, table_path
-
 
 def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None,
                     n_weights=DEFAULT_N_WEIGHTS, label='weights'):
@@ -781,7 +787,8 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1
     If `processes` > 1, one classifier is fit per node in parallel (the
     feature matrix `A` is sent to each worker once via the Pool
     initializer, rather than once per node)."""
-    id_to_row = {seq.id: i for i, seq in enumerate(sequences)}
+    # Map rows to display names (or fallback to ID) to match tree tips
+    id_to_row = {seq.display_name if seq.display_name else seq.id: i for i, seq in enumerate(sequences)}
 
     labels = {}
     for node in tree.get_nonterminals():
@@ -917,6 +924,7 @@ def main():
 
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
+        display_ids = [s.display_name if s.display_name else s.id for s in sequences]
         for t_idx, trait_name in enumerate(trait_names):
             y = annotation_matrix[:, t_idx]
             if len(np.unique(y)) < 2:
@@ -924,7 +932,7 @@ def main():
                 continue
             acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
                                        method=classifier_method, test_size=test_size,
-                                       sample_ids=[s.id for s in sequences],
+                                       sample_ids=display_ids,
                                        weight_reduction=weight_reduction, k=k)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
 
@@ -932,7 +940,7 @@ def main():
     tree = None
     if tree_mode:
         time_tree = time.time()
-        sample_labels = [seq.id for seq in sequences]
+        sample_labels = [seq.display for seq in sequences, else seq.id for seq in sequences]
         if args.bootstraps == 0:
             tree = neighbor_join_reduced(A, sample_labels)
             Phylo.write(tree, os.path.join(out_dir, "tree.newick"), "newick")
