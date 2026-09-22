@@ -13,12 +13,12 @@
 # Retornar kmers dos labels FEITO
 # Kmer = 4
 # Comparar filogenia com filogenia classica
-# Tentar colocar como esparsa a matriz de features ao inves de inicializar como zero 
-# Cortar os features não importantes para fazer bootstrapping, não selecionar da matriz completa de features. 
+# Tentar colocar como esparsa a matriz de features ao inves de inicializar como zero
+# Cortar os features não importantes para fazer bootstrapping, não selecionar da matriz completa de features.
 # Criar função para selecionar threasholds
-# fazer montagem 
-# tentar achar estrutura 
-# Tentar debuggar quitapleta 
+# fazer montagem
+# tentar achar estrutura
+# Tentar debuggar quitapleta
 
 """
 klearn.py
@@ -74,6 +74,7 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
+import scipy.sparse
 import scipy.io
 
 from sklearn.decomposition import TruncatedSVD
@@ -169,31 +170,69 @@ def criapos(janela, k):
     return idx + 1
 
 
-def inversa(endereco, k):
-    """Inverse of criapos: turn a 1-based integer address back into the
-    k-length amino-acid string it represents."""
-    idx = endereco - 1
-    chars = []
-    for _ in range(k):
-        chars.append(ALPHABET[idx % VALID_AA_COUNT])
-        idx //= VALID_AA_COUNT
-    return ''.join(reversed(chars))
+def inversa(col_idx, k, reverse_dict=None):
+    """Turn a 0-based FEATURE-MATRIX COLUMN INDEX back into the k-length
+    amino-acid k-mer string it represents. Callers always pass the plain
+    0-based column index (e.g. straight from np.argsort/selected_idx) --
+    no +1 offset needed, regardless of k.
 
+    - For k <= 4, the column index directly encodes the k-mer via the
+      base-20 addressing scheme in criapos (columns are laid out in
+      address order, so column c holds the k-mer at criapos address c+1;
+      that +1/-1 round trip is handled internally here).
+    - For k > 4, the feature matrix only has columns for k-mers that were
+      actually observed (see montaA), so `reverse_dict` (built by
+      inversa_k from the index_dict montaA returns for k > 4) is required
+      to map the column index back to its k-mer string."""
+    if k <= 4:
+        idx = col_idx
+        chars = []
+        for _ in range(k):
+            chars.append(ALPHABET[idx % VALID_AA_COUNT])
+            idx //= VALID_AA_COUNT
+        return ''.join(reversed(chars))
+    else:
+        if reverse_dict is None:
+            raise ValueError("k > 4 requires reverse_dict (see inversa_k) to decode k-mers.")
+        return reverse_dict.get(col_idx)
+
+def inversa_k(index_dict):
+    """Build a {column_index: kmer_string} reverse-lookup dict from the
+    {kmer_string: column_index} `index_dict` that montaA returns for k > 4."""
+    return {index: kmer for kmer, index in index_dict.items()}
 
 def kmerize_sequence(seq_str, k):
     """Build the k-mer composition vector for a single sequence string.
+    If kmer size is bigger than 4, returns a list of seen kmers,
+    due to exponential memory usage if the vector is stored as a sparse array. This also make it so
+    the vector in k > 4 is composed only of seen kmers.
     Returns (vector, list_of_invalid_windows)."""
     seq_str = str(seq_str).upper()
+    seen_kmers = set()
     vector = np.zeros(VALID_AA_COUNT ** k)
     invalid = []
-    for i in range(len(seq_str) - k + 1):
-        window = seq_str[i:i + k]
-        p = criapos(window, k)
-        if p != -1:
-            vector[p - 1] += 1
+    if k <= 4:
+        for i in range(len(seq_str) - k + 1):
+            window = seq_str[i:i + k]
+            p = criapos(window, k)
+            if p != -1:
+                vector[p - 1] = 1
+            else:
+                invalid.append(window)
+    else:
+        for i in range(len(seq_str) - k + 1):
+            window = seq_str[i:i + k]
+            seen_kmers.add(window)
+
+            if "X" in window:
+                invalid.append(window)
         else:
-            invalid.append(window)
-    return vector, invalid
+            seen_kmers = sorted(list(seen_kmers))
+
+    if k <= 4:
+        return vector, invalid
+    else:
+        return seen_kmers, invalid
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +338,50 @@ def create_annotation_vector(sequences):
 # Feature matrix / dimensionality reduction / clustering
 # ---------------------------------------------------------------------------
 
-def montaA(sequencias):
-    n_features = sequencias[0].kmer_vector.shape[0]
-    A = np.zeros((len(sequencias), n_features))
-    for i, seq in enumerate(sequencias):
-        A[i] = seq.kmer_vector
-    return A
+def montaA(sequencias, k):
+    """Build the sample x feature matrix A.
+    - k <= 4: every possible k-mer address is a column (dense array), as
+      before.
+    - k > 4: the feature space (VALID_AA_COUNT**k columns) is far too large
+      to store densely, so only k-mers actually OBSERVED across the dataset
+      get a column (sparse CSC matrix, presence/absence only).
+    Always returns (A, index_dict): index_dict is None for k <= 4, and the
+    {kmer_string: column_index} map for k > 4 (pass it through inversa_k to
+    get the {column_index: kmer_string} reverse lookup needed to decode
+    selected features back into k-mer strings)."""
+    if k <= 4:
+        n_features = sequencias[0].kmer_vector.shape[0]
+        a = np.zeros((len(sequencias), n_features))
+        for i, seq in enumerate(sequencias):
+            a[i] = seq.kmer_vector
+        return a, None
+    else:
+        seen_kmers = set()
+        for seq in sequencias:
+            seen_kmers.update(seq.kmer_vector)  # kmer_vector is a list of kmer strings for k > 4
+        seen_kmers = sorted(seen_kmers)
+        index_dict = {kmer: i for i, kmer in enumerate(seen_kmers)}
 
+        indices_matrix = build_vectors_from_dict(sequencias, index_dict)
+        rows, columns = [], []
+        for i, indices in enumerate(indices_matrix):
+            rows.extend([i] * len(indices))
+            columns.extend(indices)
+        data = np.ones(len(rows), dtype=np.int8)
+        # CSC: this pipeline repeatedly slices A by COLUMN (bootstrap
+        # feature resampling, reduce_weights feature selection), which CSC
+        # handles far more efficiently than the default CSR.
+        a = scipy.sparse.csr_matrix(
+            (data, (rows, columns)), shape=(len(sequencias), len(seen_kmers))
+        ).tocsc()
+        return a, index_dict
+
+def build_vectors_from_dict(sequencias, index_dict):
+    list_of_indices = []
+    for seq in sequencias:
+        indices = [index_dict[kmer] for kmer in seq.kmer_vector]
+        list_of_indices.append(indices)
+    return list_of_indices
 
 def create_sample_index(sequences):
     return {seq.id: seq for seq in sequences}
@@ -471,7 +547,7 @@ def logistica(A, indicadores):
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
                          test_size=0.25, random_state=42, sample_ids=None,
-                         weight_reduction=None, k=None):
+                         weight_reduction=None, k=None, reverse_dict=None):
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
 
@@ -580,9 +656,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         f.write(f"Confusion matrix:\n{cm}\n")
         if selected_idx is not None:
             if k is not None:
-                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
+                important_kmers = [inversa(int(idx), k, reverse_dict) for idx in selected_idx]
                 f.write(f"Selected k-mers ({len(important_kmers)}): "
-                        f"{', '.join(important_kmers)}\n")
+                        f"{', '.join(str(km) for km in important_kmers)}\n")
             else:
                 f.write(f"Selected feature indices ({len(selected_idx)}): "
                         f"{selected_idx.tolist()} (pass k-mer size to decode as sequences)\n")
@@ -906,14 +982,18 @@ def main():
     print(f"K-merization time: {time_kmerization:.2f} seconds")
 
     # 4. Build feature matrix
-    A = montaA(sequences)
-    scipy.io.savemat(os.path.join(out_dir, "feature_matrix.mat"), {"A": A})
-    np.save(os.path.join(out_dir, "feature_matrix.npy"), A)
+    a, index_dict = montaA(sequences, k)
+    reverse_dict = inversa_k(index_dict) if index_dict is not None else None
+
+    if scipy.sparse.issparse(a):
+        scipy.sparse.save_npz(os.path.join(out_dir, "feature_matrix.npz"), a)
+    else:
+        np.save(os.path.join(out_dir, "feature_matrix.npy"), a)
 
     # 5. SVD / PCA visualization
     time_visualization = time.time()
     color_labels = annotation_matrix[:, 0] if annotation_matrix is not None else None
-    A_reduced, A_k, optimal_k = singular(A, out_dir, labels=color_labels)
+    A_reduced, A_k, optimal_k = singular(a, out_dir, labels=color_labels)
     np.save(os.path.join(out_dir, "A_reduced.npy"), A_reduced)
     np.save(os.path.join(out_dir, "A_k.npy"), A_k)
 
@@ -930,26 +1010,27 @@ def main():
             if len(np.unique(y)) < 2:
                 print(f"Skipping trait '{trait_name}': only one class present.")
                 continue
-            acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
+            acc = evaluate_classifier(a, y, out_dir, trait_name=trait_name,
                                        method=classifier_method, test_size=test_size,
                                        sample_ids=display_ids,
-                                       weight_reduction=weight_reduction, k=k)
+                                       weight_reduction=weight_reduction, k=k,
+                                       reverse_dict=reverse_dict)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
 
     # 8. Phylogenetics
     tree = None
     if tree_mode:
         time_tree = time.time()
-        sample_labels = [seq.display for seq in sequences, else seq.id for seq in sequences]
+        sample_labels = [seq.display_name if seq.display_name else seq.id for seq in sequences]
         if args.bootstraps == 0:
-            tree = neighbor_join_reduced(A, sample_labels)
+            tree = neighbor_join_reduced(a, sample_labels)
             Phylo.write(tree, os.path.join(out_dir, "tree.newick"), "newick")
             fig, ax = plt.subplots(figsize=(10, 8))
             Phylo.draw(tree, axes=ax, do_show=False)
             plt.savefig(os.path.join(out_dir, "tree_image.png"), dpi=300, bbox_inches="tight")
             plt.close(fig)
         else:
-            tree = bootstrap(A, args.bootstraps, sequences, args.tree_cutoff, out_dir, processes=processes)
+            tree = bootstrap(a, args.bootstraps, sequences, args.tree_cutoff, out_dir, processes=processes)
         time_tree = time.time() - time_tree
         print(f"Phylogenetic tree construction time: {time_tree:.2f} seconds")
 
@@ -957,7 +1038,7 @@ def main():
     if args.classify_nodes:
         time_nodes = time.time()
         weight_dict, label_arrays = classify_internal_nodes(
-            tree, A, sequences, classifier=classifier_method, processes=processes
+            tree, a, sequences, classifier=classifier_method, processes=processes
         )
         report_path = os.path.join(out_dir, "node_classification.txt")
         with open(report_path, "w") as f:
@@ -965,11 +1046,11 @@ def main():
                 indicadores = label_arrays[node]
                 node_label = node.name if node.name else f"node_{id(node)}"
                 _, selected_idx = reduce_weights(
-                    A, w, indicadores, classifier=classifier_method, out_dir=out_dir,
+                    a, w, indicadores, classifier=classifier_method, out_dir=out_dir,
                     n_weights=weight_reduction or DEFAULT_N_WEIGHTS, label=node_label
                 )
-                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
-                f.write(f"{node_label}\t{','.join(important_kmers)}\n")
+                important_kmers = [inversa(int(idx), k, reverse_dict) for idx in selected_idx]
+                f.write(f"{node_label}\t{','.join(str(km) for km in important_kmers)}\n")
         time_nodes = time.time() - time_nodes
         print(f"Internal node classification time: {time_nodes:.2f} seconds")
         print(f"Internal node classification written to {report_path}")
