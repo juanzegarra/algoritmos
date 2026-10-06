@@ -19,6 +19,9 @@
 # rodar classificador nos nós da hemoglobina
 # transcriptase reversas
 # Fazer classificador com kmers montados
+#  branch and bound
+# embedding dos kmers
+# tilelan
 
 """
 klearn.py
@@ -58,7 +61,6 @@ import argparse
 import os
 from multiprocessing import Pool
 import multiprocessing as mp
-from posix import ST_RELATIME
 import time
 from collections import defaultdict
 
@@ -109,8 +111,8 @@ def parse_args():
                               'are supported. If omitted, use --phylo with --classify_nodes '
                               'for annotation-free, tree-based node classification.'
                               'Column with name Display is used for labelling figures in output plots.')
-    parser.add_argument('--phylo', type=str,
-                         help='Build a phylogenetic tree from sequence k-mer distances. Uses either Neighbor Joining or Maximum Likelihood.')
+    parser.add_argument('--phylo', action='store_true',
+                         help='Build a phylogenetic tree from sequence k-mer distances.')
     parser.add_argument('--bootstraps', '-b', type=int, default=0,
                          help='Number of bootstrap replicates for the phylogenetic tree '
                               '(0 = build a single tree with no bootstrapping). Each '
@@ -178,32 +180,37 @@ def criapos(janela, k):
         idx = idx * VALID_AA_COUNT + p
     return idx + 1
 
+def inversa(col_idx, reverse_dict=None):
+    """The feature matrix only has columns for k-mers that were
+      actually observed (see montaA), so `reverse_dict` (built by
+      inversa_k from the index_dict montaA returns for k > 4) is required inversa_k from the index_dict montaA returns for k > 4) is required
+      to map the column index back to its k-mer string."""
+    if reverse_dict is None:
+        raise ValueError("Find kmers from index requires reverse_dict (see inversa_k) to decode k-mers.")
+    return reverse_dict.get(col_idx)
 
-def inversa(endereco, k):
-    """Inverse of criapos: turn a 1-based integer address back into the
-    k-length amino-acid string it represents."""
-    idx = endereco - 1
-    chars = []
-    for _ in range(k):
-        chars.append(ALPHABET[idx % VALID_AA_COUNT])
-        idx //= VALID_AA_COUNT
-    return ''.join(reversed(chars))
+def inversa_k(index_dict):
+    """Build a {column_index: kmer_string} reverse-lookup dict from the
+    {kmer_string: column_index} `index_dict` that montaA returns for k > 4."""
+    return {index: kmer for kmer, index in index_dict.items()}
 
 
 def kmerize_sequence(seq_str, k):
-    """Build the k-mer composition vector for a single sequence string.
-    Returns (vector, list_of_invalid_windows)."""
+    """Build the k-mer composition vector for a single sequence string, returns a set of seen kmers,
+    due to exponential memory usage if the vector is stored as a sparse array. This also it so
+    the vector is composed only of seen kmers.
+    """
     seq_str = str(seq_str).upper()
-    vector = np.zeros(VALID_AA_COUNT ** k)
+    seen_kmers = set()
     invalid = []
     for i in range(len(seq_str) - k + 1):
         window = seq_str[i:i + k]
-        p = criapos(window, k)
-        if p != -1:
-            vector[p - 1] += 1
-        else:
+        if "X" in window:
             invalid.append(window)
-    return vector, invalid
+        else:
+            seen_kmers.add(window)
+    seen_kmers = sorted(seen_kmers)
+    return seen_kmers, invalid
 
 
 # ---------------------------------------------------------------------------
@@ -305,16 +312,47 @@ def create_annotation_vector(sequences):
     return matrix
 
 
+def montaA(sequencias):
+    """Build the sample x feature matrix A.
+    - k <= 4: every possible k-mer address is a column (dense array), as
+      before.
+    - k > 4: the feature space (VALID_AA_COUNT**k columns) is far too large
+      to store densely, so only k-mers actually OBSERVED across the dataset
+      get a column (sparse CSC matrix, presence/absence only).
+    Always returns (A, index_dict): index_dict is None for k <= 4, and the
+    {kmer_string: column_index} map for k > 4 (pass it through inversa_k to
+    get the {column_index: kmer_string} reverse lookup needed to decode
+    selected features back into k-mer strings)."""
+    seen_kmers = set()
+    for seq in sequencias:
+        seen_kmers.update(seq.kmer_vector)  # kmer_vector is a list of kmer strings for
+    seen_kmers = sorted(seen_kmers)
+    index_dict = {kmer: i for i, kmer in enumerate(seen_kmers)}
+
+    indices_matrix = build_vectors_from_dict(sequencias, index_dict)
+    rows, columns = [], []
+    for i, indices in enumerate(indices_matrix):
+        rows.extend([i] * len(indices))
+        columns.extend(indices)
+    data = np.ones(len(rows), dtype=np.int8)
+    # CSC: this pipeline repeatedly slices A by COLUMN (bootstrap
+    # feature resampling, reduce_weights feature selection), which CSC
+    # handles far more efficiently than the default CSR.
+    a = scipy.sparse.csr_matrix(
+        (data, (rows, columns)), shape=(len(sequencias), len(seen_kmers))
+    ).tocsc()
+    return a, index_dict
+
+def build_vectors_from_dict(sequencias, index_dict):
+    list_of_indices = []
+    for seq in sequencias:
+        indices = [index_dict[kmer] for kmer in seq.kmer_vector]
+        list_of_indices.append(indices)
+    return list_of_indices
+
 # ---------------------------------------------------------------------------
 # Feature matrix / dimensionality reduction / clustering
 # ---------------------------------------------------------------------------
-
-def montaA(sequencias):
-    n_features = sequencias[0].kmer_vector.shape[0]
-    A = np.zeros((len(sequencias), n_features))
-    for i, seq in enumerate(sequencias):
-        A[i] = seq.kmer_vector
-    return A
 
 
 def create_sample_index(sequences):
@@ -481,7 +519,7 @@ def logistica(A, indicadores):
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
                          test_size=0.25, random_state=42, sample_ids=None,
-                         weight_reduction=None, k=None):
+                         weight_reduction=None, k=None, reverse_dict=None):
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
 
@@ -589,17 +627,13 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         f.write(f"Test accuracy: {accuracy:.4f}\n")
         f.write(f"Confusion matrix:\n{cm}\n")
         if selected_idx is not None:
-            if k is not None:
-                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
-                important_lowest = [inversa(int(idx) + 1, k) for idx in lowest_idx]
-                important_highest = [inversa(int(idx) + 1, k) for idx in highest_idx]
-                f.write(f"Selected k-mers ({len(important_kmers)}): "
-                        f"{', '.join(important_kmers)}\n"
-                        f"Lowest kmers: {', '.join(important_lowest)}\n"
-                        f"Highest kmers: {', '.join(important_highest)}\n")
-            else:
-                f.write(f"Selected feature indices ({len(selected_idx)}): "
-                        f"{selected_idx.tolist()} (pass k-mer size to decode as sequences)\n")
+            important_kmers = [inversa(int(idx), reverse_dict) for idx in selected_idx]
+            important_lowest = [inversa(int(idx), reverse_dict) for idx in lowest_idx]
+            important_highest = [inversa(int(idx), reverse_dict) for idx in highest_idx]
+            f.write(f"Selected k-mers ({len(important_kmers)}): "
+                    f"{', '.join(important_kmers)}\n"
+                    f"Lowest kmers: {', '.join(important_lowest)}\n"
+                    f"Highest kmers: {', '.join(important_highest)}\n")
 
     # Generate two plots: one strictly for the test partition, one for the whole dataset
     plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test")
@@ -704,7 +738,7 @@ def neighbor_join_reduced(A, sample_labels, target_variance=0.90):
     svd_optimal = TruncatedSVD(n_components=optimal_k, random_state=42)
     A_k = svd_optimal.fit_transform(A)
 
-    dist_condensed = pdist(A_k, metric='euclidean')
+    dist_condensed = pdist(A_k, metric='cosine')
     square_form = squareform(dist_condensed)
 
     # Biopython's DistanceMatrix wants a lower-triangular "ragged" matrix:
@@ -912,58 +946,80 @@ def assemble_kmers(important_kmers, k):
     # 7. Deduplicate and return longest contigs first
     return sorted(list(set(contigs)), key=len, reverse=True)
 
-def run_classifier_on_assembly(assembled, sequences, classifier_method="linear", labels=None, test_size=0.25, weight_reduction=None, k=None, out_dir=None, trait_name=None):
+def run_classifier_on_assembly(assembled, sequences, classifier_method="linear", labels=None, test_size=0.25, weight_reduction=None, k=None, out_dir=None, trait_vector=None):
     """Run the classifier using assembled contigs as predictors"""
     if not labels:
         labels = [seq.anno for seq in sequences]
     fastas = [(i, seq.id, seq.seq) for i, seq in enumerate(sequences)]
-    kmers = [(i, seq.seq) for i, seq in enumerate(assembled)]
+    kmers = sorted([seq.seq for seq in assembled])
+    reversed = {i: str(kmer) for i, kmer in enumerate(kmers)}
     A = np.zeros((len(fastas), len(kmers)))
     for i, (_, _, seq) in enumerate(fastas):
         for j, (_, kmer) in enumerate(kmers):
             if kmer in seq:
                 A[i, j] = 1
-    acc = evaluate_classifier(A, labels, out_dir, trait_name=trait_name,
+    for i, label_vector in enumerate(labels):
+        acc = evaluate_classifier(A, label_vector, out_dir, trait_name=trait_vector[i],
                                method=classifier_method, test_size=test_size,
                                sample_ids=[seq.id for seq in sequences],
-                               weight_reduction=weight_reduction, k=k)
+                               weight_reduction=weight_reduction, k=k, reverse_dict=reversed)
 
-    print(f"Accuracy on trait {trait_name}: {acc}")
+    print(f"Accuracy on trait {trait_vector[i]}: {acc}")
 
 def parse_assembled_file(path):
     """Parse the fasta assembled contigs file"""
     entries = []
     fastas = SeqIO.parse(path, "fasta")
-    for seq in fastas:
-        entries.append((seq.id, str(seq.seq)))
+    entries = list(fastas)
     return entries
 
 
 def parse_node_classification_file(path):
     """Parse a node_classification.txt file (one line per tree node:
-    `node_label<TAB>kmer1,kmer2,...`, as written by the --classify_nodes
-    report). Returns {node_label: [kmer, ...]}, skipping any node with an
+    `node_label<TAB>kmer1,kmer2,...\n lowest_kmers\n highest_kmers`, as written by the --classify_nodes
+    report). Returns {node_label: (kmers, lowest_kmers, highest_kmers)}, skipping any node with an
     empty k-mer list."""
     entries = {}
+    lowest_kmers = None
+    highest_kmers = None
     with open(path) as f:
+        lowest = False
+        highest = False
+        new_node = False
+        kmers = None
+        highest_kmers = None
+        lowest_kmers = None
+        node_label = None
         for line in f:
             line = line.rstrip("\n")
-            if not line or "\t" not in line:
+            if not line or "\t" not in line or "," not in line:
                 continue
-            node_label, kmers_field = line.split("\t", 1)
-            kmers = [km.strip() for km in kmers_field.split(",") if km.strip()]
-            if kmers:
-                entries[node_label] = kmers
+            if "\t" in line:
+                node_label, kmers_field = line.split("\t", 1)
+                kmers = [km.strip() for km in kmers_field.split(",") if km.strip()]
+                new_node = True
+            elif new_node:
+                lowest = True
+                lowest_kmers = line.strip().split(",")
+                if lowest and not highest:
+                    highest_kmers = line.strip().split(",")
+                    highest = True
+            if lowest and highest and new_node:
+                entries[node_label] = (kmers, lowest_kmers, highest_kmers)
+                new_node = False
+                lowest = False
+                highest = False
     return entries
-
 
 def parse_trait_report_file(path):
     """Parse a classifier_<trait>_report.txt file (as written by
-    evaluate_classifier). Returns (trait_name, kmers) where kmers is None if
-    the report has no "Selected k-mers" line -- which happens when that run
-    didn't use --weight_reduction, so there's nothing to assemble."""
+    evaluate_classifier). Returns (trait_name, (kmers, lowest_kmers, highest_kmers))
+    where the tuple is None if the report has no "Selected k-mers" line."""
     trait_name = None
     kmers = None
+    lowest_kmers = []
+    highest_kmers = []
+
     with open(path) as f:
         for line in f:
             line = line.rstrip("\n")
@@ -973,7 +1029,17 @@ def parse_trait_report_file(path):
                 # e.g. "Selected k-mers (20): AAA, BBB, ..."
                 after_colon = line.split(":", 1)[1]
                 kmers = [km.strip() for km in after_colon.split(",") if km.strip()]
-    return trait_name, kmers
+            elif line.startswith("Lowest kmers:"):
+                after_colon = line.split(":", 1)[1]
+                lowest_kmers = [km.strip() for km in after_colon.split(",") if km.strip()]
+            elif line.startswith("Highest kmers:"):
+                after_colon = line.split(":", 1)[1]
+                highest_kmers = [km.strip() for km in after_colon.split(",") if km.strip()]
+
+    if kmers is not None:
+        return trait_name, (kmers, lowest_kmers, highest_kmers)
+
+    return trait_name, None
 
 
 # ---------------------------------------------------------------------------
@@ -1039,13 +1105,20 @@ def main():
             return
 
         for label, kmers in kmer_sources.items():
-            contigs = assemble_kmers(kmers, k)
-            safe_label = "".join(c if c.isalnum() else "_" for c in label)
-            fasta_path = os.path.join(out_dir, f"{safe_label}_contigs.fasta")
-            with open(fasta_path, "w") as f:
-                for i, contig in enumerate(contigs):
-                    f.write(f">{safe_label}_contig_{i}\n{contig}\n")
-            print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
+            for kmer, lowest, highest in kmers:
+                contigs = assemble_kmers(kmer, k)
+                lowest_contigs = assemble_kmers(lowest, k)
+                highest_contigs = assemble_kmers(highest, k)
+                safe_label = "".join(c if c.isalnum() else "_" for c in label)
+                fasta_path = os.path.join(out_dir, f"{safe_label}_contigs.fasta")
+                with open(fasta_path, "w") as f:
+                    for i, contig in enumerate(contigs):
+                        f.write(f">{safe_label}_contig_{i}\n{contig}\n")
+                    for i, contig in enumerate(lowest_contigs):
+                        f.write(f">{safe_label}_lowest_contig_{i}\n{contig}\n")
+                    for i, contig in enumerate(highest_contigs):
+                        f.write(f">{safe_label}_highest_contig_{i}\n{contig}\n")
+                print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
 
         time_assemble = time.time() - time_kmers
         print(f"Assembled k-mers in {time_assemble:.2f} seconds")
@@ -1088,10 +1161,6 @@ def main():
     # 3. K-merize (parallel or sequential)
     time_kmerization = time.time()
 
-    if k > 4:
-        print(f"Note: k={k} means a {VALID_AA_COUNT**k:,}-dimensional feature vector per "
-              f"sequence; this may use a lot of memory.")
-
     if processes > 1:
         with Pool(processes=processes) as pool:
             results = pool.starmap(kmerize_sequence, [(s.seq, k) for s in sequences])
@@ -1106,9 +1175,10 @@ def main():
     print(f"K-merization time: {time_kmerization:.2f} seconds")
 
     # 4. Build feature matrix
-    A = montaA(sequences)
-    scipy.io.savemat(os.path.join(out_dir, "feature_matrix.mat"), {"A": A})
-    np.save(os.path.join(out_dir, "feature_matrix.npy"), A)
+    A, index_dict = montaA(sequences)
+    reverse_dict = inversa_k(index_dict)
+    import scipy.sparse as sp
+    sp.save_npz(os.path.join(out_dir, "feature_matrix.npz"), A)
 
     # 5. SVD / PCA visualization
     time_visualization = time.time()
@@ -1133,14 +1203,14 @@ def main():
             acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
                                        method=classifier_method, test_size=test_size,
                                        sample_ids=display_ids,
-                                       weight_reduction=weight_reduction, k=k)
+                                       weight_reduction=weight_reduction, k=k ,reverse_dict=reverse_dict)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
 
     # 8. Phylogenetics
     tree = None
     if tree_mode:
         time_tree = time.time()
-        sample_labels = [seq.id for seq in sequences]
+        sample_labels = [seq.display_name if seq.display_name else seq.id for seq in sequences]
         if args.bootstraps == 0:
             tree = neighbor_join_reduced(A, sample_labels)
             Phylo.write(tree, os.path.join(out_dir, "tree.newick"), "newick")
@@ -1168,9 +1238,9 @@ def main():
                     A, w, indicadores, classifier=classifier_method, out_dir=out_dir,
                     n_weights=weight_reduction or DEFAULT_N_WEIGHTS, label=node_label
                 )
-                important_kmers = [inversa(int(idx) + 1, k) for idx in selected_idx]
-                important_lowest = [inversa(int(idx) + 1, k) for idx in lowest_idx]
-                important_highest = [inversa(int(idx) + 1, k) for idx in highest_idx]
+                important_kmers = [inversa(int(idx), reverse_dict) for idx in selected_idx]
+                important_lowest = [inversa(int(idx), reverse_dict) for idx in lowest_idx]
+                important_highest = [inversa(int(idx), reverse_dict) for idx in highest_idx]
                 f.write(f"{node_label} - lowest - highest\t{','.join(important_kmers)}\n{','.join(important_lowest)}\n{','.join(important_highest)}\n")
         time_nodes = time.time() - time_nodes
         print(f"Internal node classification time: {time_nodes:.2f} seconds")
@@ -1187,12 +1257,14 @@ def main():
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
     # Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
-    if args.classify_assembled and sequences:
-        if os.path.isfile(args.assembled):
-            assembled = parse_assembled_file(args.assembled)
-            run_classifier_on_assembly(assembled, sequences, classifier_method=classifier_method, out_dir=f"{out_dir}/assembly_classification", trait_name=f"{args.classify_assembled}")
+    if args.classify_assembled and sequences and trait_names:
+        if os.path.isfile(args.classify_assembled):
+            assembled = parse_assembled_file(args.classify_assembled)
+            if not os.path.isdir(f"{out_dir}/assembly_classification"):
+                os.makedirs(f"{out_dir}/assembly_classification", exist_ok=True)
+            run_classifier_on_assembly(assembled, sequences, classifier_method=classifier_method, out_dir=f"{out_dir}/assembly_classification", trait_vector=trait_names)
         else:
-            print(f"Assembled kmers file not found: {args.assembled}")
+            print(f"Assembled kmers file not found: {args.classify_assembled}")
 
 
 if __name__ == '__main__':
