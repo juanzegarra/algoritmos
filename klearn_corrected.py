@@ -47,7 +47,7 @@ in the same run.
 Steps:
   1. Read protein sequences from a FASTA file.
   2. (optional) Read one or more binary trait annotations (tab-separated file).
-  3. Build a k-mer composition feature matrix for every sequence.
+  3. Build a k-mer composition feature matrix for every sequence (view build ).
   4. Reduce dimensionality with truncated SVD (PCA-style) and visualize it.
   5. Cluster samples with KMeans as a quick unsupervised sanity check.
   6. (annotation mode) Train/test a classifier for each trait and report
@@ -56,6 +56,8 @@ Steps:
      distances, with or without bootstrap support.
   8. (tree-classification mode) Classify internal tree nodes (clades) from
      k-mer features and report the most discriminative k-mers for each node.
+  9. (classify assembled) Test whether the assenbled peptides from the lowest and
+     highest weighted kmers are also valid for separating the groups.
 """
 import argparse
 import os
@@ -77,7 +79,6 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
-import scipy.io
 
 
 from sklearn.decomposition import TruncatedSVD
@@ -149,6 +150,10 @@ def parse_args():
                               'trait/node found. Does not require --anno or --phylo.')
     parser.add_argument('--classify_assembled', type=str, default=None, metavar='PATH',
                          help='Classify assembled contigs using the classifier trained on the full dataset.')
+    parser.add_argument('--trained_model', type=str, default=None, metavar='PATH', help='Vector output by trained model (e.g. trained_model.npy)')
+    parser.add_argument('--kmer_weights_file', type=str, default=None, metavar='PATH',
+                        help='File output by weight reduction that is used to return'
+                            'the summation of weight values during assembly.')
 
 
     return parser.parse_args()
@@ -201,15 +206,15 @@ def kmerize_sequence(seq_str, k):
     the vector is composed only of seen kmers.
     """
     seq_str = str(seq_str).upper()
-    seen_kmers = set()
+    seen_kmers = defaultdict(int)
     invalid = []
     for i in range(len(seq_str) - k + 1):
         window = seq_str[i:i + k]
         if "X" in window:
             invalid.append(window)
         else:
-            seen_kmers.add(window)
-    seen_kmers = sorted(seen_kmers)
+            seen_kmers[window] += 1
+    seen_kmers = dict(sorted(seen_kmers.items()))
     return seen_kmers, invalid
 
 
@@ -311,44 +316,41 @@ def create_annotation_vector(sequences):
         matrix[i] = seq.anno
     return matrix
 
-
 def montaA(sequencias):
     """Build the sample x feature matrix A.
-    - k <= 4: every possible k-mer address is a column (dense array), as
-      before.
-    - k > 4: the feature space (VALID_AA_COUNT**k columns) is far too large
+    - The feature space (VALID_AA_COUNT**k columns) is far too large
       to store densely, so only k-mers actually OBSERVED across the dataset
-      get a column (sparse CSC matrix, presence/absence only).
-    Always returns (A, index_dict): index_dict is None for k <= 4, and the
-    {kmer_string: column_index} map for k > 4 (pass it through inversa_k to
-    get the {column_index: kmer_string} reverse lookup needed to decode
-    selected features back into k-mer strings)."""
+      get a column (sparse CSC matrix, frequencies).
+    Always returns (A, index_dict)."""
+
     seen_kmers = set()
     for seq in sequencias:
-        seen_kmers.update(seq.kmer_vector)  # kmer_vector is a list of kmer strings for
+        # Calling .update() on a dictionary automatically adds its keys
+        seen_kmers.update(seq.kmer_vector)
+
     seen_kmers = sorted(seen_kmers)
     index_dict = {kmer: i for i, kmer in enumerate(seen_kmers)}
 
-    indices_matrix = build_vectors_from_dict(sequencias, index_dict)
-    rows, columns = [], []
-    for i, indices in enumerate(indices_matrix):
-        rows.extend([i] * len(indices))
-        columns.extend(indices)
-    data = np.ones(len(rows), dtype=np.int8)
-    # CSC: this pipeline repeatedly slices A by COLUMN (bootstrap
-    # feature resampling, reduce_weights feature selection), which CSC
-    # handles far more efficiently than the default CSR.
+    rows, columns, data = [], [], []
+
+    # Iterate through sequences and populate the coordinate lists
+    for i, seq in enumerate(sequencias):
+        for kmer, count in seq.kmer_vector.items():
+            rows.append(i)
+            columns.append(index_dict[kmer])
+            data.append(count)  # We append the actual frequency instead of just a 1
+
+    # Build CSR matrix and convert to CSC
+    # Note: dtype changed from np.int8 to np.int32 in case counts exceed 127
     a = scipy.sparse.csr_matrix(
-        (data, (rows, columns)), shape=(len(sequencias), len(seen_kmers))
+        (data, (rows, columns)),
+        shape=(len(sequencias), len(seen_kmers)),
+        dtype=np.int32
     ).tocsc()
+
     return a, index_dict
 
-def build_vectors_from_dict(sequencias, index_dict):
-    list_of_indices = []
-    for seq in sequencias:
-        indices = [index_dict[kmer] for kmer in seq.kmer_vector]
-        list_of_indices.append(indices)
-    return list_of_indices
+
 
 # ---------------------------------------------------------------------------
 # Feature matrix / dimensionality reduction / clustering
@@ -554,11 +556,11 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         )
 
         # Test set predictions
-        scores_test = sigmoid(X_test[:, selected_idx] @ w_selected)
+        scores_test = sigmoid(X_test @ w_selected)
         y_pred_test = np.where(scores_test >= 0.5, 1, 0)
 
         # All data predictions
-        scores_all = sigmoid(A[:, selected_idx] @ w_selected)
+        scores_all = sigmoid(A @ w_selected)
         y_pred_all = np.where(scores_all >= 0.5, 1, 0)
 
     elif method == 'linear':
@@ -634,6 +636,11 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                     f"{', '.join(important_kmers)}\n"
                     f"Lowest kmers: {', '.join(important_lowest)}\n"
                     f"Highest kmers: {', '.join(important_highest)}\n")
+    if w_selected and reverse_dict:
+        with open("kmer_weight.tsv", "w") as f:
+            f.write("kmer\tweight")
+            for i, weight in enumerate(w_selected):
+                f.write(f"{inversa(int(i), reverse_dict)}\t{w_selected[i]}\n")
 
     # Generate two plots: one strictly for the test partition, one for the whole dataset
     plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test")
@@ -693,36 +700,50 @@ def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait
 
     return fig_path, table_path
 
+import numpy as np
+
 def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None,
-                    n_weights=DEFAULT_N_WEIGHTS, label='weights'):
+                   n_weights=DEFAULT_N_WEIGHTS, label='weights'):
     """Pick the `n_weights` most negative and `n_weights` most positive
     weighted features, refit on just those 2*n_weights features, and return
-    the refit weights together with their indices IN THE ORIGINAL FEATURE
-    SPACE. If `out_dir` is given, also saves two weight plots (before and
-    after the refit) named from `label` -- pass a distinct string `label`
-    per call (e.g. the trait name or a tree node's name), or repeated calls
-    will overwrite each other's plots."""
+    a full-sized weight vector with the refitted weights in their original
+    positions (and 0 everywhere else)."""
+
     if out_dir is not None:
         plot_weights(weight_vector, out_dir, trait_name=f'{label}_all')
 
+    # 1. Select the top indices from the original model
     lowest_idx = np.argsort(weight_vector)[:n_weights]
     highest_idx = np.argsort(weight_vector)[-n_weights:][::-1]
     selected_idx = np.concatenate([lowest_idx, highest_idx])
 
+    # 2. Refit the model on just the selected features
     A_selected = A[:, selected_idx]
     weight_vector_selected = fit_linear_classifier(A_selected, indicadores, method=classifier)
 
+    # 3. Sort the newly refitted weights to ensure we only keep the top ones
     order = np.argsort(weight_vector_selected)
     lowest_local = order[:n_weights]
     highest_local = order[-n_weights:][::-1]
     final_local = np.concatenate([lowest_local, highest_local])
 
+    # 4. Map the final local indices back to the original feature space
     final_original_idx = selected_idx[final_local]
+
+    # 5. Build the full-sized sparse weight vector (the fix)
+    # A.shape[1] reliably gives the total number of original features
+    trained_model = np.zeros(A.shape[1], dtype=np.float64)
+
+    # Place the selected refitted weights into their original indices
+    trained_model[final_original_idx] = weight_vector_selected[final_local]
+
+    np.save(f"reduced_trained_model{label}.npy", trained_model)
+
     if out_dir is not None:
         plot_weights(weight_vector_selected[final_local], out_dir, trait_name=f'{label}_selected')
-    return weight_vector_selected[final_local], final_original_idx, lowest_idx, highest_idx
 
-
+    # Return your new full-sized sparse model instead of the truncated one
+    return trained_model, final_original_idx, lowest_idx, highest_idx
 # ---------------------------------------------------------------------------
 # Phylogenetics
 # ---------------------------------------------------------------------------
@@ -867,7 +888,13 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1
 # k-mer assembly
 # ---------------------------------------------------------------------------
 
-def assemble_kmers(important_kmers, k):
+# Read tsv file that maps each kmer to its value learned from classification
+def parse_kmer_weight_file(weight_kmer_file):
+    kmer_weight_df = pd.read_csv(weight_kmer_file, sep="\t")
+    kmer_weight_dict = kmer_weight_df.set_index(kmer_weight_df.columns[0])[kmer_weight_df.columns[1]].to_dict()
+    return kmer_weight_dict
+
+def assemble_kmers(important_kmers, k, weight_kmer_dict):
     """
     Assemble a set of discriminative k-mers into contigs via a De Bruijn graph.
     Branches at multi-out-degree nodes to return ALL possible valid sequences.
@@ -1064,14 +1091,19 @@ def main():
     classifier_method = args.classifier
     test_size = args.test_size
     weight_reduction = args.weight_reduction
+    kmer_weight = args.kmer_weights_file
 
     # Assemble k-mers from a file (or directory) produced by an earlier run's
     # --classify_nodes / --anno + --weight_reduction reports. This is a
     # standalone mode: it does not need --anno or --phylo.
     if assemble_target:
+        if not kmer_weight:
+            print("Lacking tsv file that maps kmers to their weight")
+            return
         time_kmers = time.time()
         print(f"Assembling k-mers from {assemble_target}...")
 
+        kmer_weight_dict = parse_kmer_weight_file(kmer_weight)
         kmer_sources = {}  # label -> list of kmer strings
 
         if os.path.isdir(assemble_target):
@@ -1106,18 +1138,18 @@ def main():
 
         for label, kmers in kmer_sources.items():
             for kmer, lowest, highest in kmers:
-                contigs = assemble_kmers(kmer, k)
-                lowest_contigs = assemble_kmers(lowest, k)
-                highest_contigs = assemble_kmers(highest, k)
+                contigs = assemble_kmers(kmer, k, kmer_weight_dict)
+                lowest_contigs = assemble_kmers(lowest, k, kmer_weight_dict)
+                highest_contigs = assemble_kmers(highest, k, kmer_weight_dict)
                 safe_label = "".join(c if c.isalnum() else "_" for c in label)
                 fasta_path = os.path.join(out_dir, f"{safe_label}_contigs.fasta")
-                with open(fasta_path, "w") as f:
+                with open(f"{fasta_path}_all_kmers.fasta", "w") as all, open(f"{fasta_path}_highest_kmers.fasta") as high, open(f"{fasta_path}_lowest_kmers.fasta") as low:
                     for i, contig in enumerate(contigs):
-                        f.write(f">{safe_label}_contig_{i}\n{contig}\n")
+                        all.write(f">{safe_label}_contig_{i}\n{contig}\n")
                     for i, contig in enumerate(lowest_contigs):
-                        f.write(f">{safe_label}_lowest_contig_{i}\n{contig}\n")
+                        high.write(f">{safe_label}_lowest_contig_{i}\n{contig}\n")
                     for i, contig in enumerate(highest_contigs):
-                        f.write(f">{safe_label}_highest_contig_{i}\n{contig}\n")
+                        low.write(f">{safe_label}_highest_contig_{i}\n{contig}\n")
                 print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
 
         time_assemble = time.time() - time_kmers
