@@ -22,6 +22,7 @@
 #  branch and bound
 # embedding dos kmers
 # tilelan
+# 2.(sen.spec)/sen+spec
 
 """
 klearn.py
@@ -69,6 +70,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from pandas.core.indexes.category import NDArrayBackedExtensionIndex
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3D projection)
 
@@ -79,6 +81,7 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
+from scipy.sparse import csr_matrix
 
 
 from sklearn.decomposition import TruncatedSVD
@@ -217,6 +220,9 @@ def kmerize_sequence(seq_str, k):
     seen_kmers = dict(sorted(seen_kmers.items()))
     return seen_kmers, invalid
 
+# Helper to convert raw logits to probabilities [0, 1]
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
 
 # ---------------------------------------------------------------------------
 # Sequence container
@@ -342,7 +348,7 @@ def montaA(sequencias):
 
     # Build CSR matrix and convert to CSC
     # Note: dtype changed from np.int8 to np.int32 in case counts exceed 127
-    a = scipy.sparse.csr_matrix(
+    a = csr_matrix(
         (data, (rows, columns)),
         shape=(len(sequencias), len(seen_kmers)),
         dtype=np.int32
@@ -524,6 +530,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                          weight_reduction=None, k=None, reverse_dict=None):
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
+    w_selected = None
+    best_threshold = 0.5
 
     try:
         idx_train, idx_test = train_test_split(
@@ -544,9 +552,6 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
 
     selected_idx = None
 
-    # Helper to convert raw logits to probabilities [0, 1]
-    def sigmoid(x):
-        return 1 / (1 + np.exp(-x))
 
     if method == 'linear' and weight_reduction is not None:
         w = fit_linear_classifier(X_train, y_train, method='linear')
@@ -555,24 +560,39 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             n_weights=weight_reduction, label=trait_name
         )
 
-        # Test set predictions
         scores_test = sigmoid(X_test @ w_selected)
-        y_pred_test = np.where(scores_test >= 0.5, 1, 0)
+        # Find best threshold value for maximizing specifity and sensitivity product
+        fpr, tpr, thresholds = roc_curve(y_test, scores_test)
+        specificity = 1 - fpr
+        area = specificity * tpr
+
+        optimal_idx = np.argmax(area)
+        best_threshold = thresholds[optimal_idx]
+
+        y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
 
         # All data predictions
-        scores_all = sigmoid(A @ w_selected)
-        y_pred_all = np.where(scores_all >= 0.5, 1, 0)
+        scores_all = sigmoid(A @ w)
+        y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
     elif method == 'linear':
         w = fit_linear_classifier(X_train, y_train, method='linear')
 
         # Test set predictions
         scores_test = sigmoid(X_test @ w)
-        y_pred_test = np.where(scores_test >= 0.5, 1, 0)
+        # Find best threshold value for maximizing specifity and sensitivity product
+        fpr, tpr, thresholds = roc_curve(y_test, scores_test)
+        specificity = 1 - fpr
+        area = specificity * tpr
+
+        optimal_idx = np.argmax(area)
+        best_threshold = thresholds[optimal_idx]
+
+        y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
 
         # All data predictions
         scores_all = sigmoid(A @ w)
-        y_pred_all = np.where(scores_all >= 0.5, 1, 0)
+        y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
     elif method == 'logreg':
         if weight_reduction is not None:
@@ -636,19 +656,19 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                     f"{', '.join(important_kmers)}\n"
                     f"Lowest kmers: {', '.join(important_lowest)}\n"
                     f"Highest kmers: {', '.join(important_highest)}\n")
-    if w_selected and reverse_dict:
+    if w_selected != None and reverse_dict:
         with open("kmer_weight.tsv", "w") as f:
-            f.write("kmer\tweight")
-            for i, weight in enumerate(w_selected):
+            f.write("kmer\tweight\n")
+            for i in range(len(w_selected)):
                 f.write(f"{inversa(int(i), reverse_dict)}\t{w_selected[i]}\n")
 
     # Generate two plots: one strictly for the test partition, one for the whole dataset
-    plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test")
-    plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all")
+    plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test", best_threshold=best_threshold or 0.5)
+    plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all", best_threshold=best_threshold or 0.5)
 
     return accuracy
 
-def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name):
+def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name, best_threshold=0.5):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     scores = np.asarray(scores)
@@ -678,8 +698,8 @@ def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait
                    color=color, marker='x', linewidths=2,
                    s=70, label=f'true label {int(cls)} — misclassified')
 
-    # Threshold updated to 0.5 for probability bounds
-    ax.axvline(0.5, color='gray', linestyle='--', linewidth=1, label='decision threshold (0.5)')
+    # Use best threshold value from roc_curve (max (tpr * (1 - fpr)))
+    ax.axvline(best_threshold, color='gray', linestyle='--', linewidth=1, label=f'decision threshold ({best_threshold})')
     ax.set_yticks(y_positions)
     ax.set_yticklabels(sorted_ids, fontsize=7)
     ax.set_xlabel('Predicted Probability')
@@ -699,8 +719,6 @@ def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait
             f.write(f"{sid}\t{int(t)}\t{int(p)}\t{s:.4f}\n")
 
     return fig_path, table_path
-
-import numpy as np
 
 def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=None,
                    n_weights=DEFAULT_N_WEIGHTS, label='weights'):
@@ -737,27 +755,49 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
     # Place the selected refitted weights into their original indices
     trained_model[final_original_idx] = weight_vector_selected[final_local]
 
-    np.save(f"reduced_trained_model{label}.npy", trained_model)
-
     if out_dir is not None:
         plot_weights(weight_vector_selected[final_local], out_dir, trait_name=f'{label}_selected')
-
+        np.save(f"reduced_trained_model{label}.npy", trained_model)
     # Return your new full-sized sparse model instead of the truncated one
     return trained_model, final_original_idx, lowest_idx, highest_idx
+
+def classify_new_sequences(A, sequences, trained_vector, threshold, trait=None, model_name=None):
+    A_predictions = A @ trained_vector
+    seq_scores = sigmoid(A_predictions)
+    seq_classification = np.where(seq_scores < threshold, 0, 1)
+    if len(sequences) != len(seq_classification):
+        print("Trained vector and sequences do not match dimensions, exiting...")
+        return
+    else:
+        with open(f"model_classifcation{trait}.txt", "w") as f:
+            f.write(f"#CLASSIFICATIONS RETURNED BY MODEL {model_name} threshold value {threshold}\nID\tlogit_score\tclassifcation\n")
+            for i in range(len(sequences)):
+                    f.writelines(f"{sequences[i].id}\t{seq_scores[i]}\t{seq_classification[i]}\n")
+
+
+
+
 # ---------------------------------------------------------------------------
 # Phylogenetics
 # ---------------------------------------------------------------------------
 
 def neighbor_join_reduced(A, sample_labels, target_variance=0.90):
     max_components = max(1, min(A.shape[0], A.shape[1]) - 1)
-    svd = TruncatedSVD(n_components=max_components, random_state=42)
-    svd.fit(A)
-
-    cumulative_variance = np.cumsum(svd.explained_variance_ratio_)
-    optimal_k = min(np.argmax(cumulative_variance >= target_variance) + 1, max_components)
-
-    svd_optimal = TruncatedSVD(n_components=optimal_k, random_state=42)
-    A_k = svd_optimal.fit_transform(A)
+    cum = [0]
+    limit = 200
+    while cum[-1] < target_variance:
+        cap = min(max_components, limit)
+        svd = TruncatedSVD(n_components=cap, random_state=42)
+        Z = svd.fit_transform(A)                      # U * Sigma, already computed
+        cum = np.cumsum(svd.explained_variance_ratio_)
+        if cum[-1] < target_variance:
+            print("target not reached with", cap, "components")   # or double cap and refit
+            limit = 2 * limit
+        if limit >= max_components:
+            break
+    else:
+        optimal_k = int(min(np.searchsorted(cum, target_variance) + 1, cap))
+        A_k = Z[:, :optimal_k]                        # no second fit
 
     dist_condensed = pdist(A_k, metric='cosine')
     square_form = squareform(dist_condensed)
@@ -799,7 +839,7 @@ def bootstrap(A, n_bootstrap, sequences, tree_cutoff, out_dir, processes=None):
     a single replicate, which Biopython's DistanceMatrix rejects with
     "ValueError: Duplicate names found".)"""
     trees = []
-    sample_labels = [s.id for s in sequences]
+    sample_labels = [s.display_name if s.display_name else s.id for s in sequences]
     n_features = A.shape[1]
 
     if not processes or processes <= 1 or n_bootstrap <= 1:
@@ -866,6 +906,8 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1
         for seq_id, row in id_to_row.items():
             if seq_id in descendant_ids:
                 vector[row] = 1.0
+        if vector.sum() == len(vector) or vector.sum() == 0:
+            continue
         labels[node] = vector
 
     nodes = list(labels.keys())
@@ -894,7 +936,7 @@ def parse_kmer_weight_file(weight_kmer_file):
     kmer_weight_dict = kmer_weight_df.set_index(kmer_weight_df.columns[0])[kmer_weight_df.columns[1]].to_dict()
     return kmer_weight_dict
 
-def assemble_kmers(important_kmers, k, weight_kmer_dict):
+def assemble_kmers(important_kmers, k):
     """
     Assemble a set of discriminative k-mers into contigs via a De Bruijn graph.
     Branches at multi-out-degree nodes to return ALL possible valid sequences.
@@ -973,25 +1015,39 @@ def assemble_kmers(important_kmers, k, weight_kmer_dict):
     # 7. Deduplicate and return longest contigs first
     return sorted(list(set(contigs)), key=len, reverse=True)
 
+def weight_contigs(kmer_weight_dict, k, contigs):
+    contig_weight = defaultdict(float)
+    for seq in contigs:
+        total_sum = 0
+        all_kmers = [seq[i:i+k] for i in range(len(seq) - k + 1)]
+        kmer_set = set(all_kmers)
+
+        for kmer in kmer_set:
+            total_sum += float(kmer_weight_dict[kmer])
+
+        contig_weight[seq] = total_sum
+
+    return contig_weight
+
 def run_classifier_on_assembly(assembled, sequences, classifier_method="linear", labels=None, test_size=0.25, weight_reduction=None, k=None, out_dir=None, trait_vector=None):
     """Run the classifier using assembled contigs as predictors"""
     if not labels:
-        labels = [seq.anno for seq in sequences]
+        labels = np.matrix([seq.anno for seq in sequences])
     fastas = [(i, seq.id, seq.seq) for i, seq in enumerate(sequences)]
-    kmers = sorted([seq.seq for seq in assembled])
+    kmers = sorted([str(seq.seq) for seq in assembled])
     reversed = {i: str(kmer) for i, kmer in enumerate(kmers)}
     A = np.zeros((len(fastas), len(kmers)))
     for i, (_, _, seq) in enumerate(fastas):
-        for j, (_, kmer) in enumerate(kmers):
+        for j, kmer in enumerate(kmers):
             if kmer in seq:
                 A[i, j] = 1
-    for i, label_vector in enumerate(labels):
+    for i, label_vector in enumerate(labels.T):
         acc = evaluate_classifier(A, label_vector, out_dir, trait_name=trait_vector[i],
                                method=classifier_method, test_size=test_size,
-                               sample_ids=[seq.id for seq in sequences],
+                               sample_ids=[seq.display_name if seq.display_name else seq.id for seq in sequences],
                                weight_reduction=weight_reduction, k=k, reverse_dict=reversed)
 
-    print(f"Accuracy on trait {trait_vector[i]}: {acc}")
+        print(f"Accuracy on trait {trait_vector[i]}: {acc}")
 
 def parse_assembled_file(path):
     """Parse the fasta assembled contigs file"""
@@ -1007,35 +1063,32 @@ def parse_node_classification_file(path):
     report). Returns {node_label: (kmers, lowest_kmers, highest_kmers)}, skipping any node with an
     empty k-mer list."""
     entries = {}
-    lowest_kmers = None
-    highest_kmers = None
-    with open(path) as f:
-        lowest = False
-        highest = False
+
+    with open(path, "r") as f:
+        lines = f.readlines()
         new_node = False
-        kmers = None
+        all_kmers = None
         highest_kmers = None
         lowest_kmers = None
         node_label = None
-        for line in f:
-            line = line.rstrip("\n")
-            if not line or "\t" not in line or "," not in line:
+        for i in range(len(lines)):
+            line = lines[i].strip("\n")
+            if not line:
                 continue
-            if "\t" in line:
-                node_label, kmers_field = line.split("\t", 1)
-                kmers = [km.strip() for km in kmers_field.split(",") if km.strip()]
+            if "node_" in line:
+                node_label = line
                 new_node = True
-            elif new_node:
-                lowest = True
-                lowest_kmers = line.strip().split(",")
-                if lowest and not highest:
-                    highest_kmers = line.strip().split(",")
-                    highest = True
-            if lowest and highest and new_node:
-                entries[node_label] = (kmers, lowest_kmers, highest_kmers)
+                all_kmers = lines[i+1].strip().split(",")
+                lowest_kmers = lines[i+3].strip().split(",")
+                highest_kmers = lines[i+5].strip().split(",")
+
+            if lowest_kmers and highest_kmers and new_node:
+                entries[node_label] = (all_kmers, lowest_kmers, highest_kmers)
                 new_node = False
-                lowest = False
-                highest = False
+                highest_kmers = None
+                lowest_kmers = None
+                all_kmers = None
+
     return entries
 
 def parse_trait_report_file(path):
@@ -1047,7 +1100,7 @@ def parse_trait_report_file(path):
     lowest_kmers = []
     highest_kmers = []
 
-    with open(path) as f:
+    with open(path, "r") as f:
         for line in f:
             line = line.rstrip("\n")
             if line.startswith("Trait:"):
@@ -1103,14 +1156,15 @@ def main():
         time_kmers = time.time()
         print(f"Assembling k-mers from {assemble_target}...")
 
-        kmer_weight_dict = parse_kmer_weight_file(kmer_weight)
-        kmer_sources = {}  # label -> list of kmer strings
+        kmer_weight_dict = parse_kmer_weight_file(kmer_weight) # kmer -> associated weight returned by classifier
+        kmer_sources = {}  # label -> list of kmer strings for every file (node_classification or classification_report)
 
         if os.path.isdir(assemble_target):
             node_file = os.path.join(assemble_target, "node_classification.txt")
             if os.path.exists(node_file):
                 kmer_sources.update(parse_node_classification_file(node_file))
             for fname in sorted(os.listdir(assemble_target)):
+                # Handle classifier reports
                 if fname.startswith("classifier_") and fname.endswith("_report.txt"):
                     trait_name, kmers = parse_trait_report_file(os.path.join(assemble_target, fname))
                     if kmers:
@@ -1118,11 +1172,12 @@ def main():
                     elif trait_name:
                         print(f"Note: '{trait_name}' report has no selected k-mers "
                               f"(that run likely didn't use --weight_reduction) -- skipping.")
+        # Handle aasembling from tree node classification
         elif os.path.isfile(assemble_target):
             basename = os.path.basename(assemble_target)
             if basename == "node_classification.txt":
                 kmer_sources.update(parse_node_classification_file(assemble_target))
-            else:
+            elif basename.startswith("classifier_"):
                 trait_name, kmers = parse_trait_report_file(assemble_target)
                 if kmers:
                     kmer_sources[trait_name or basename] = kmers
@@ -1138,18 +1193,25 @@ def main():
 
         for label, kmers in kmer_sources.items():
             for kmer, lowest, highest in kmers:
-                contigs = assemble_kmers(kmer, k, kmer_weight_dict)
-                lowest_contigs = assemble_kmers(lowest, k, kmer_weight_dict)
-                highest_contigs = assemble_kmers(highest, k, kmer_weight_dict)
+                contigs = assemble_kmers(kmer, k)
+                lowest_contigs = assemble_kmers(lowest, k)
+                highest_contigs = assemble_kmers(highest, k)
                 safe_label = "".join(c if c.isalnum() else "_" for c in label)
+
+                # Create a master dictionary to hold weight sum of every contig
+                contig_weight_dict = defaultdict(float)
+                lowest_weight, highest_weight, all_weight = weight_contigs(lowest_contigs, k, kmer_weight_dict), weight_contigs(highest_contigs, k, kmer_weight_dict), weight_contigs(contigs, k, kmer_weight_dict)
+                for d in lowest_weight, highest_weight, all_weight:
+                    contig_weight_dict.update(d)
                 fasta_path = os.path.join(out_dir, f"{safe_label}_contigs.fasta")
-                with open(f"{fasta_path}_all_kmers.fasta", "w") as all, open(f"{fasta_path}_highest_kmers.fasta") as high, open(f"{fasta_path}_lowest_kmers.fasta") as low:
+                # Write a file for high low and all, keep weight sum information in description
+                with open(f"{fasta_path}_all_kmers.fasta", "w") as all, open(f"{fasta_path}_highest_kmers.fasta", "w") as high, open(f"{fasta_path}_lowest_kmers.fasta", "w") as low:
                     for i, contig in enumerate(contigs):
-                        all.write(f">{safe_label}_contig_{i}\n{contig}\n")
+                        all.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
                     for i, contig in enumerate(lowest_contigs):
-                        high.write(f">{safe_label}_lowest_contig_{i}\n{contig}\n")
+                        high.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
                     for i, contig in enumerate(highest_contigs):
-                        low.write(f">{safe_label}_highest_contig_{i}\n{contig}\n")
+                        low.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
                 print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
 
         time_assemble = time.time() - time_kmers
@@ -1273,7 +1335,7 @@ def main():
                 important_kmers = [inversa(int(idx), reverse_dict) for idx in selected_idx]
                 important_lowest = [inversa(int(idx), reverse_dict) for idx in lowest_idx]
                 important_highest = [inversa(int(idx), reverse_dict) for idx in highest_idx]
-                f.write(f"{node_label} - lowest - highest\t{','.join(important_kmers)}\n{','.join(important_lowest)}\n{','.join(important_highest)}\n")
+                f.write(f"{node_label}\nall_kmers\n{','.join(important_kmers)}\nlowest_kmers\n{','.join(important_lowest)}\nhighest_kmers\n{','.join(important_highest)}\n")
         time_nodes = time.time() - time_nodes
         print(f"Internal node classification time: {time_nodes:.2f} seconds")
         print(f"Internal node classification written to {report_path}")
@@ -1289,7 +1351,13 @@ def main():
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
     # Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
-    if args.classify_assembled and sequences and trait_names:
+    if args.classify_assembled:
+        if not sequences:
+            print("Lacking fasta file with sequences for assembly classification")
+            return
+        if not trait_names:
+            print("Lacking annotation for assembly classification")
+            return
         if os.path.isfile(args.classify_assembled):
             assembled = parse_assembled_file(args.classify_assembled)
             if not os.path.isdir(f"{out_dir}/assembly_classification"):
