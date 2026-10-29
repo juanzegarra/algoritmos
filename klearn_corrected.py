@@ -56,8 +56,12 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
+<<<<<<< HEAD
 from scipy.sparse import csr_matrix
 
+=======
+import scipy.io
+>>>>>>> 7fb6579 (Update klearn_corrected.py)
 
 from sklearn.decomposition import TruncatedSVD
 from sklearn.cluster import KMeans
@@ -1148,7 +1152,7 @@ def main():
         if not os.path.isfile(trained_vector):
             print("Non-exis")
         sequences = SeqIO.parse(args.fasta, "fasta")
-        classify_new_seqs(sequences, trained_vector)
+        classify_new_seqs(sequences, trained_vector, k, id_mapping_file)
 
     # Assemble k-mers from a file (or directory) produced by an earlier run's
     # --classify_nodes / --anno + --weight_reduction reports. This is a
