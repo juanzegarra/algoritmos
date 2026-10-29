@@ -1,3 +1,12 @@
+<<<<<<< HEAD
+=======
+# Implementar paralelismo no classificador dos nós
+# Paralelismo no bootstrap das árvores
+# Fazer plot do P(x) ordenado cor diferente para os labels
+# Aumentar numero de kmers para classificação
+# Retornar kmers dos labels
+# Kmer = 4
+>>>>>>> c40fdf2 (altered klearn)
 
 """
 klearn.py
@@ -474,6 +483,7 @@ def fit_linear_classifier(A, indicadores, method='linear'):
         raise ValueError(f"Unknown classifier method: {method}")
 
 # plot the feature weights
+<<<<<<< HEAD
 def plot_weights(w, out_dir, trait_name='trait'):
     """Scatter plot of a classifier's per-feature weights, sorted ascending.
     Saved to out_dir/<trait_name>_weights.png -- pass a distinct
@@ -489,16 +499,36 @@ def plot_weights(w, out_dir, trait_name='trait'):
     safe_name = "".join(c if c.isalnum() else "_" for c in trait_name)
     fig.savefig(os.path.join(out_dir, f'{safe_name}_weights.png'))
     plt.close(fig)
+=======
+def plot_weights(w, out_dir=None, trait_name='trait'):
+    w = np.sort(w)
+    plt.figure()
+    plt.plot(range(len(w)), w, "*", s=10)
+    plt.xlabel('Feature')
+    plt.ylabel('Weight')
+    plt.title(f'Feature weights for {trait_name}')
+    plt.savefig(os.path.join(out_dir, f'{trait_name}_weights.png'))
+    plt.close()
+>>>>>>> c40fdf2 (altered klearn)
 
 
 # kept for backwards compatibility with the original function name
 def logistica(A, indicadores):
     return fit_linear_classifier(A, indicadores, method='linear')
 
+<<<<<<< HEAD
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
                          test_size=0.25, random_state=42, sample_ids=None,
                          weight_reduction=None, k=None, reverse_dict=None):
+=======
+
+## Change this function to accept weight reduction and refitting
+def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
+                         test_size=0.25, random_state=42, w=None):
+    """Train/test split, fit `method` classifier, and save a figure with a
+    confusion matrix and ROC curve to out_dir. Returns test accuracy."""
+>>>>>>> c40fdf2 (altered klearn)
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
     w_selected = None
@@ -514,6 +544,7 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             idx_all, test_size=test_size, random_state=random_state
         )
 
+<<<<<<< HEAD
     X_train, X_test = A[idx_train], A[idx_test]
     y_train, y_test = indicadores[idx_train], indicadores[idx_test]
 
@@ -565,6 +596,14 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         scores_all = sigmoid(A @ w)
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
+=======
+    if method == 'linear':
+        if w is None:
+            w = fit_linear_classifier(X_train, y_train, method='linear')
+        w_red, kmer_idx = reduce_weights(A, w, indicadores, classifier='linear', out_dir=out_dir)
+        scores_test = X_test @ w_red
+        y_pred = np.where(scores_test >= 0, 1, 0)
+>>>>>>> c40fdf2 (altered klearn)
     elif method == 'logreg':
         if weight_reduction is not None:
             print(f"Note: --weight_reduction only applies to --classifier linear; "
@@ -1296,6 +1335,7 @@ def main():
 
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
+<<<<<<< HEAD
         display_ids = [s.display_name if s.display_name else s.id for s in sequences]
         for t_idx, trait_name in enumerate(trait_names):
             y = annotation_matrix[:, t_idx]
@@ -1307,6 +1347,17 @@ def main():
                                        sample_ids=display_ids,
                                        weight_reduction=weight_reduction, k=k ,reverse_dict=reverse_dict)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
+=======
+        with open(os.path.join(out_dir, "important_kmers_annotation.txt"), "w") as f:
+            for t_idx, trait_name in enumerate(trait_names):
+                y = annotation_matrix[:, t_idx]
+                if len(np.unique(y)) < 2:
+                    print(f"Skipping trait '{trait_name}': only one class present.")
+                    continue
+                acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
+                                           method=classifier_method, test_size=test_size)
+                print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
+>>>>>>> c40fdf2 (altered klearn)
 
     # 8. Phylogenetics
     tree = None
