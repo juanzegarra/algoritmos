@@ -1,12 +1,18 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+>>>>>>> c2db774 (Update klearn_corrected.py)
 # Implementar paralelismo no classificador dos nós
 # Paralelismo no bootstrap das árvores
 # Fazer plot do P(x) ordenado cor diferente para os labels
 # Aumentar numero de kmers para classificação
 # Retornar kmers dos labels
 # Kmer = 4
+<<<<<<< HEAD
 >>>>>>> c40fdf2 (altered klearn)
+=======
+>>>>>>> c2db774 (Update klearn_corrected.py)
 
 """
 klearn.py
@@ -517,6 +523,7 @@ def logistica(A, indicadores):
     return fit_linear_classifier(A, indicadores, method='linear')
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
                          test_size=0.25, random_state=42, sample_ids=None,
@@ -525,6 +532,11 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
 
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
+=======
+
+## Change this function to accept weight reduction and refitting
+def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
+>>>>>>> c2db774 (Update klearn_corrected.py)
                          test_size=0.25, random_state=42, w=None):
     """Train/test split, fit `method` classifier, and save a figure with a
     confusion matrix and ROC curve to out_dir. Returns test accuracy."""
@@ -544,6 +556,7 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             idx_all, test_size=test_size, random_state=random_state
         )
 
+<<<<<<< HEAD
 <<<<<<< HEAD
     X_train, X_test = A[idx_train], A[idx_test]
     y_train, y_test = indicadores[idx_train], indicadores[idx_test]
@@ -597,6 +610,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
 =======
+=======
+>>>>>>> c2db774 (Update klearn_corrected.py)
     if method == 'linear':
         if w is None:
             w = fit_linear_classifier(X_train, y_train, method='linear')
@@ -1336,6 +1351,7 @@ def main():
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
 <<<<<<< HEAD
+<<<<<<< HEAD
         display_ids = [s.display_name if s.display_name else s.id for s in sequences]
         for t_idx, trait_name in enumerate(trait_names):
             y = annotation_matrix[:, t_idx]
@@ -1348,6 +1364,8 @@ def main():
                                        weight_reduction=weight_reduction, k=k ,reverse_dict=reverse_dict)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
 =======
+=======
+>>>>>>> c2db774 (Update klearn_corrected.py)
         with open(os.path.join(out_dir, "important_kmers_annotation.txt"), "w") as f:
             for t_idx, trait_name in enumerate(trait_names):
                 y = annotation_matrix[:, t_idx]
@@ -1357,7 +1375,10 @@ def main():
                 acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
                                            method=classifier_method, test_size=test_size)
                 print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
+<<<<<<< HEAD
 >>>>>>> c40fdf2 (altered klearn)
+=======
+>>>>>>> c2db774 (Update klearn_corrected.py)
 
     # 8. Phylogenetics
     tree = None
