@@ -1,5 +1,6 @@
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 =======
 >>>>>>> c2db774 (Update klearn_corrected.py)
@@ -13,6 +14,8 @@
 >>>>>>> c40fdf2 (altered klearn)
 =======
 >>>>>>> c2db774 (Update klearn_corrected.py)
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
 """
 klearn.py
@@ -72,11 +75,16 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
 <<<<<<< HEAD
+<<<<<<< HEAD
 from scipy.sparse import csr_matrix
 
 =======
 import scipy.io
 >>>>>>> 7fb6579 (Update klearn_corrected.py)
+=======
+from scipy.sparse import csr_matrix
+
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
 from sklearn.decomposition import TruncatedSVD
 from sklearn.cluster import KMeans
@@ -490,6 +498,9 @@ def fit_linear_classifier(A, indicadores, method='linear'):
 
 # plot the feature weights
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 def plot_weights(w, out_dir, trait_name='trait'):
     """Scatter plot of a classifier's per-feature weights, sorted ascending.
     Saved to out_dir/<trait_name>_weights.png -- pass a distinct
@@ -505,6 +516,7 @@ def plot_weights(w, out_dir, trait_name='trait'):
     safe_name = "".join(c if c.isalnum() else "_" for c in trait_name)
     fig.savefig(os.path.join(out_dir, f'{safe_name}_weights.png'))
     plt.close(fig)
+<<<<<<< HEAD
 =======
 def plot_weights(w, out_dir=None, trait_name='trait'):
     w = np.sort(w)
@@ -516,12 +528,15 @@ def plot_weights(w, out_dir=None, trait_name='trait'):
     plt.savefig(os.path.join(out_dir, f'{trait_name}_weights.png'))
     plt.close()
 >>>>>>> c40fdf2 (altered klearn)
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
 
 # kept for backwards compatibility with the original function name
 def logistica(A, indicadores):
     return fit_linear_classifier(A, indicadores, method='linear')
 
+<<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
 ## Change this function to accept weight reduction and refitting
@@ -541,6 +556,12 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     """Train/test split, fit `method` classifier, and save a figure with a
     confusion matrix and ROC curve to out_dir. Returns test accuracy."""
 >>>>>>> c40fdf2 (altered klearn)
+=======
+## Change this function to accept weight reduction and refitting
+def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
+                         test_size=0.25, random_state=42, sample_ids=None,
+                         weight_reduction=None, k=None, reverse_dict=None):
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
     w_selected = None
@@ -558,6 +579,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
 
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
     X_train, X_test = A[idx_train], A[idx_test]
     y_train, y_test = indicadores[idx_train], indicadores[idx_test]
 
@@ -609,6 +633,7 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         scores_all = sigmoid(A @ w)
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
+<<<<<<< HEAD
 =======
 =======
 >>>>>>> c2db774 (Update klearn_corrected.py)
@@ -619,6 +644,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         scores_test = X_test @ w_red
         y_pred = np.where(scores_test >= 0, 1, 0)
 >>>>>>> c40fdf2 (altered klearn)
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
     elif method == 'logreg':
         if weight_reduction is not None:
             print(f"Note: --weight_reduction only applies to --classifier linear; "
@@ -1206,7 +1233,11 @@ def main():
         if not os.path.isfile(trained_vector):
             print("Non-exis")
         sequences = SeqIO.parse(args.fasta, "fasta")
+<<<<<<< HEAD
         classify_new_seqs(sequences, trained_vector, k, id_mapping_file)
+=======
+        classify_new_seqs(sequences, trained_vector)
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
     # Assemble k-mers from a file (or directory) produced by an earlier run's
     # --classify_nodes / --anno + --weight_reduction reports. This is a
@@ -1352,6 +1383,9 @@ def main():
     if annotation_mode:
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
         display_ids = [s.display_name if s.display_name else s.id for s in sequences]
         for t_idx, trait_name in enumerate(trait_names):
             y = annotation_matrix[:, t_idx]
@@ -1363,6 +1397,7 @@ def main():
                                        sample_ids=display_ids,
                                        weight_reduction=weight_reduction, k=k ,reverse_dict=reverse_dict)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
+<<<<<<< HEAD
 =======
 =======
 >>>>>>> c2db774 (Update klearn_corrected.py)
@@ -1379,6 +1414,8 @@ def main():
 >>>>>>> c40fdf2 (altered klearn)
 =======
 >>>>>>> c2db774 (Update klearn_corrected.py)
+=======
+>>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
     # 8. Phylogenetics
     tree = None
