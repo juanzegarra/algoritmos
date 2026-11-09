@@ -1,24 +1,3 @@
-# Paralelismo no bootstrap das árvores FEITO
-# Fazer plot do P(x) ordenado cor diferente para os labels
-# Retornar kmers dos labels FEITO
-# Kmer = 4
-# kmeans com valor de K cumsum=0.9 FEITO
-# cumsum=0.9 usar o aux de 0.9 para consturir arvore FEITO
-# plotar pesos da regressão FEITO
-# fazer arvore com alinhamento multiplo e neighbor-joining FEITO
-# Implementar paralelismo no classificador dos nós
-# Paralelismo no bootstrap das árvores FEITO
-# Fazer plot do P(x) ordenado cor diferente para os labels
-# Aumentar numero de kmers para classificação FEITO (adicionei flag para dar entrada no número de kmers desejados)
-# Retornar kmers dos labels FEITO
-# Kmer = 4
-# Comparar filogenia com filogenia classica
-# Implementar filogenia via maxima verossimilhança
-# fazer montagem dos pesos negativos e positivos separada
-# usar kmers maiores para c7L
-# rodar classificador nos nós da hemoglobina
-# transcriptase reversas
-# Fazer classificador com kmers montados
 #  branch and bound
 # embedding dos kmers
 # tilelan
@@ -66,6 +45,7 @@ from multiprocessing import Pool
 import multiprocessing as mp
 import time
 from collections import defaultdict
+import gzip
 
 
 import numpy as np
@@ -82,6 +62,7 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix
+
 
 
 from sklearn.decomposition import TruncatedSVD
@@ -356,12 +337,45 @@ def montaA(sequencias):
 
     return a, index_dict
 
+def write_index_file(index_dict, out_dir=None):
+    os.makedirs(out_dir, exist_ok=True)
+    encoded_l = front_encoding(index_dict.keys())
+    with open(f"{out_dir}/index.f", "w") as f:
+        f.write(encoded_l)
 
+# Use front encoding to compress index list of kmers
+def front_encoding(l):
+    encoded_l = []
+    for i in range(len(l) - 1):
+        if i == 0:
+            encoded_l.append((0, l[i]))
+        for j in len(l[i]):
+            if l[i][j] == l[i+1][j]:
+                continue
+            else:
+                encoded_l.append((j, l[i+1][j:]))
+    return encoded_l
+
+# Decompress the front enconded text
+def front_decoding(l):
+    decoded_l = []
+    for i in range(len(l) - 1):
+        if i == 0:
+            decoded_l.append(l[i][1])
+        prefix = l[i][1][:l[i+1][0]]
+        next_entry = prefix + l[i+1][1]
+        decoded_l.append(next_entry)
+
+def build_vectors_from_dict(sequencias, index_dict):
+    list_of_indices = []
+    for seq in sequencias:
+        indices = [index_dict[kmer] for kmer in seq.kmer_vector]
+        list_of_indices.append(indices)
+    return list_of_indices
 
 # ---------------------------------------------------------------------------
 # Feature matrix / dimensionality reduction / clustering
 # ---------------------------------------------------------------------------
-
 
 def create_sample_index(sequences):
     return {seq.id: seq for seq in sequences}
@@ -464,28 +478,11 @@ def run_kmeans(A_reduced, n_clusters, out_dir):
 # regression), plus train/test accuracy evaluation with plots.
 # ---------------------------------------------------------------------------
 
+from scipy.linalg import solve
 def resolve2(A, b):
-    """Solve the dual (sample-space) formulation of ridge regression:
-       [ I   A^T ] [x]   [0]
-       [ A   -I  ] [y] = [b]
-    which is equivalent to x = (A^T A + I)^-1 A^T b, but solved in an
-    m-dimensional system (m = number of samples) instead of an n-dimensional
-    one (n = number of features) -- useful when n >> m, as is typical for
-    k-mer feature vectors."""
-    m, n = A.shape
-
-    In = eye(n, format="csr")
-    Im = eye(m, format="csr")
-
-    bm = np.concatenate([np.zeros(n), b])
-
-    M = bmat([
-        [In, A.T],
-        [A, -Im]
-    ], format="csr")
-
-    x = spsolve(M, bm)
-    return x[:n]
+    Af = A.astype(np.float64)
+    G = (Af @ Af.T).toarray() + np.eye(A.shape[0])
+    return Af.T @ solve(G, b, assume_a='pos')
 
 
 def fit_linear_classifier(A, indicadores, method='linear'):
@@ -564,9 +561,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         # Find best threshold value for maximizing specifity and sensitivity product
         fpr, tpr, thresholds = roc_curve(y_test, scores_test)
         specificity = 1 - fpr
-        area = specificity * tpr
+        harmonic_avr = (specificity * tpr) / (specificity + tpr)
 
-        optimal_idx = np.argmax(area)
+        optimal_idx = np.argmax(harmonic_avr)
         best_threshold = thresholds[optimal_idx]
 
         y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
@@ -583,9 +580,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         # Find best threshold value for maximizing specifity and sensitivity product
         fpr, tpr, thresholds = roc_curve(y_test, scores_test)
         specificity = 1 - fpr
-        area = specificity * tpr
+        harmonic_avr = (specificity * tpr) / (specificity + tpr)
 
-        optimal_idx = np.argmax(area)
+        optimal_idx = np.argmax(harmonic_avr)
         best_threshold = thresholds[optimal_idx]
 
         y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
@@ -667,6 +664,13 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all", best_threshold=best_threshold or 0.5)
 
     return accuracy
+
+def coordinate_compression(l):
+    compressed_data = set(l)
+    rows, columns = [], []
+
+    for i in range(len(l)):
+
 
 def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name, best_threshold=0.5):
     y_true = np.asarray(y_true)
@@ -1274,6 +1278,7 @@ def main():
     import scipy.sparse as sp
     sp.save_npz(os.path.join(out_dir, "feature_matrix.npz"), A)
 
+
     # 5. SVD / PCA visualization
     time_visualization = time.time()
     color_labels = annotation_matrix[:, 0] if annotation_matrix is not None else None
@@ -1351,18 +1356,12 @@ def main():
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
     # Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
-    if args.classify_assembled:
-        if not sequences:
-            print("Lacking fasta file with sequences for assembly classification")
-            return
-        if not trait_names:
-            print("Lacking annotation for assembly classification")
-            return
+    if args.classify_assembled and sequences and trait_names:
         if os.path.isfile(args.classify_assembled):
             assembled = parse_assembled_file(args.classify_assembled)
             if not os.path.isdir(f"{out_dir}/assembly_classification"):
                 os.makedirs(f"{out_dir}/assembly_classification", exist_ok=True)
-            run_classifier_on_assembly(assembled, sequences, classifier_method=classifier_method, out_dir=f"{out_dir}/assembly_classification", trait_vector=trait_names)
+            run_classifier_on_assembly(assembled, sequences, classifier_method=classifier_method, out_dir=f"{out_dir}/assembly_classification", trait_vector=trait_names, weight_reduction=weight_reduction, k=k)
         else:
             print(f"Assembled kmers file not found: {args.classify_assembled}")
 
