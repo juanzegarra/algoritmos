@@ -4,17 +4,7 @@
 #
 #
 ''' 2. Assembly and --classify_assembled crashes
-[ ] parse_node_classification_file (lines 1066–1091):
-The writer (line 1338) emits 7 lines per node: label, all_kmers, list, lowest_kmers, list, highest_kmers, list.
-The parser reads offsets +1, +3, +5, which are the literal header words. The lists are at +2, +4, +6.
-It detects a node with "node_" in line. Biopython’s NJ names inner nodes Inner1, Inner2, and so on, so it matches nothing; it only matches the node_<id> fallback.
-Simplest fix: write one TSV line per node, label<TAB>all<TAB>lowest<TAB>highest with comma-separated lists, and parse by splitting.
-[ ] Line 1194: for kmer, lowest, highest in kmers: iterates over a single 3-tuple and unpacks each list into three names. Use kmer, lowest, highest = kmers.
-[ ] Line 1202: the three weight_contigs(...) calls have their arguments in the wrong order. The signature is (kmer_weight_dict, k, contigs).
-[ ] Line 1207: high and low are opened without "w", which raises FileNotFoundError.
 [ ] Lines 1210–1213: lowest contigs go into the high file and highest into the low file. Swap them.
-[ ] run_classifier_on_assembly, line 1034: np.matrix makes label_vector a 1×n matrix, so evaluate_classifier fails on indexing. Use np.array([s.anno for s in sequences]); labels.T then iterates correctly.
-[ ] Line 1354: --classify_assembled silently does nothing without --anno, and it only runs after the full pipeline. Print a message, and ideally make it runnable on its own.
 [ ] Collision: run_classifier_on_assembly calls evaluate_classifier, which overwrites the real kmer_weight.tsv in the current directory with contig weights. Fixing the per-trait filename (above) resolves this.
 3. Missing implementations
 [ ] Per-node weight files. Node classification saves no kmer_weight table, so node-based --assemble_kmers would hit a KeyError in weight_contigs. Write one weight table per node.
@@ -107,6 +97,7 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix
+import scipy.sparse as sp
 from optht import optht
 
 
@@ -133,7 +124,7 @@ def parse_args():
                      'based classification (--anno) and/or tree-based node classification '
                      '(--phylo --classify_nodes).'
     )
-    parser.add_argument('--fasta', '-f', type=str,
+    parser.add_argument('--fasta', '-f', type=str, ,
                          help='FASTA file with protein sequences.')
     parser.add_argument('--anno', '-a', type=str, default=None,
                          help='Optional annotation file, tab-separated, first row as header '
@@ -1062,7 +1053,7 @@ def weight_contigs(kmer_weight_dict, k, contigs):
 def run_classifier_on_assembly(assembled, sequences, classifier_method="linear", labels=None, test_size=0.25, weight_reduction=None, k=None, out_dir=None, trait_vector=None):
     """Run the classifier using assembled contigs as predictors"""
     if not labels:
-        labels = np.matrix([seq.anno for seq in sequences])
+        labels = np.array([seq.anno for seq in sequences])
     fastas = [(i, seq.id, seq.seq) for i, seq in enumerate(sequences)]
     kmers = sorted([str(seq.seq) for seq in assembled])
     reversed = {i: str(kmer) for i, kmer in enumerate(kmers)}
@@ -1105,7 +1096,7 @@ def parse_node_classification_file(path):
             line = lines[i].strip("\n")
             if not line:
                 continue
-            if "node_" in line:
+            if "node_" or  "Inner" in line:
                 node_label = line
                 new_node = True
                 all_kmers = lines[i+2].strip().split(",")
@@ -1222,27 +1213,27 @@ def main():
             return
 
         for label, kmers in kmer_sources.items():
-            for kmer, lowest, highest in kmers:
-                contigs = assemble_kmers(kmer, k)
-                lowest_contigs = assemble_kmers(lowest, k)
-                highest_contigs = assemble_kmers(highest, k)
-                safe_label = "".join(c if c.isalnum() else "_" for c in label)
+            kmer, lowest, highest = kmers
+            contigs = assemble_kmers(kmer, k)
+            lowest_contigs = assemble_kmers(lowest, k)
+            highest_contigs = assemble_kmers(highest, k)
+            safe_label = "".join(c if c.isalnum() else "_" for c in label)
 
-                # Create a master dictionary to hold weight sum of every contig
-                contig_weight_dict = defaultdict(float)
-                lowest_weight, highest_weight, all_weight = weight_contigs(lowest_contigs, k, kmer_weight_dict), weight_contigs(highest_contigs, k, kmer_weight_dict), weight_contigs(contigs, k, kmer_weight_dict)
-                for d in lowest_weight, highest_weight, all_weight:
-                    contig_weight_dict.update(d)
-                fasta_path = os.path.join(out_dir, f"{safe_label}_contigs.fasta")
-                # Write a file for high low and all, keep weight sum information in description
-                with open(f"{fasta_path}_all_kmers.fasta", "w") as all, open(f"{fasta_path}_highest_kmers.fasta", "w") as high, open(f"{fasta_path}_lowest_kmers.fasta", "w") as low:
-                    for i, contig in enumerate(contigs):
-                        all.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
-                    for i, contig in enumerate(lowest_contigs):
-                        high.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
-                    for i, contig in enumerate(highest_contigs):
-                        low.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
-                print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
+            # Create a master dictionary to hold weight sum of every contig
+            contig_weight_dict = defaultdict(float)
+            lowest_weight, highest_weight, all_weight = weight_contigs(kmer_weight_dict , k, lowest_contigs), weight_contigs(kmer_weight_dict , k, highest_contigs ), weight_contigs(kmer_weight_dict, k, contigs)
+            for d in lowest_weight, highest_weight, all_weight:
+                contig_weight_dict.update(d)
+            fasta_path = os.path.join(out_dir, f"{safe_label}_contigs.fasta")
+            # Write a file for high low and all, keep weight sum information in description
+            with open(f"{fasta_path}_all_kmers.fasta", "w") as all, open(f"{fasta_path}_highest_kmers.fasta", "w") as high, open(f"{fasta_path}_lowest_kmers.fasta", "w") as low:
+                for i, contig in enumerate(contigs):
+                    all.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
+                for i, contig in enumerate(lowest_contigs):
+                    high.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
+                for i, contig in enumerate(highest_contigs):
+                    low.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
+            print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
 
         time_assemble = time.time() - time_kmers
         print(f"Assembled k-mers in {time_assemble:.2f} seconds")
@@ -1301,8 +1292,7 @@ def main():
     # 4. Build feature matrix
     A, index_dict = montaA(sequences)
     reverse_dict = inversa_k(index_dict)
-    import scipy.sparse as sp
-    sp.save_npz(os.path.join(out_dir, "feature_matrix.npz"), A)
+
 
 
     # 5. SVD / PCA visualization
@@ -1383,6 +1373,7 @@ def main():
 
     # Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
     if args.classify_assembled and sequences and trait_names:
+
         if os.path.isfile(args.classify_assembled):
             assembled = parse_assembled_file(args.classify_assembled)
             if not os.path.isdir(f"{out_dir}/assembly_classification"):
@@ -1391,6 +1382,12 @@ def main():
         else:
             print(f"Assembled kmers file not found: {args.classify_assembled}")
 
+    elif not trait_names:
+        print(f"Missing annotation vector for running classifcation, please provide matching annotation file for sequences.")
+        return
+    elif not sequences:
+       print("Missing fasta file with original sequences used for classification, please provide sequence file.")
+       return
 
 if __name__ == '__main__':
     main()
