@@ -1,7 +1,7 @@
-#  branch and bound
-# embedding dos kmers
-# tilelan
+# new seq classifcation -> find a way to parse several sequences for classification without breaking ram and parallelizing classifcation
 # 2.(sen.spec)/sen+spec
+# gavish donoho
+#
 
 """
 klearn.py
@@ -45,12 +45,10 @@ from multiprocessing import Pool
 import multiprocessing as mp
 import time
 from collections import defaultdict
-import gzip
 
 
 import numpy as np
 import pandas as pd
-from pandas.core.indexes.category import NDArrayBackedExtensionIndex
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3D projection)
 
@@ -62,6 +60,7 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix
+from optht import optht
 
 
 
@@ -380,7 +379,7 @@ def build_vectors_from_dict(sequencias, index_dict):
 def create_sample_index(sequences):
     return {seq.id: seq for seq in sequences}
 
-
+from scipy.linalg import eigh
 def singular(A, out_dir, labels=None, target_variance=0.70):
     """Truncated SVD dimensionality reduction. Returns:
        - A_pca_scaled: samples projected onto the top-3 components, scaled so
@@ -389,29 +388,26 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
        - A_k: samples projected onto the smallest number of components whose
          cumulative explained variance reaches `target_variance`.
     A 3D scatter plot of A_pca_scaled is saved to out_dir/pca_scaled.png."""
-    max_components = max(1, min(A.shape[0], A.shape[1]) - 1)
+    m, n = A.shape
 
-    svd = TruncatedSVD(n_components=max_components, random_state=42)
-    svd.fit(A)
-
-    cumulative_variance = np.cumsum(svd.explained_variance_ratio_)
-    reached = np.argmax(cumulative_variance >= target_variance)
-    if cumulative_variance[reached] < target_variance:
-        print(f"Warning: target variance {target_variance:.0%} not reached with "
-              f"{max_components} components (max cumulative = "
-              f"{cumulative_variance[-1]:.2%}). Using all available components.")
-    optimal_k = min(reached + 1, max_components)
+    G = (A @ A.T).toarray()
+    ev = eigh(G, eigvals_only=True)[::-1]
+    svs = np.sqrt(np.maximum(ev, 0.0))
+    beta = min(m, n) / max(m, n)
+    optimal_k = optht(beta, svs)
+    optimal_k = max(int(optimal_k), 1)
 
     svd_optimal = TruncatedSVD(n_components=optimal_k, random_state=42)
     A_k = svd_optimal.fit_transform(A)
 
-    s = svd.singular_values_
+    s = svd_optimal.singular_values_
     sum_s2_total = np.sum(s ** 2)
-    n_top = min(3, max_components)
-    explained_variance = np.sort(svd.explained_variance_ratio_)
+    n_top = min(3, A_k.shape[1])
+    explained_variance = np.sort(svd_optimal.explained_variance_ratio_)
+    cumulative_variance = np.cumsum(ev) / ev.sum()
 
     scree_fig, scree_ax = plt.subplots(figsize=(10, 6))
-    scree_ax.plot(explained_variance, 'o-')
+    scree_ax.plot(s, 'o-')
     scree_ax.set_xlabel('Singular Value Index')
     scree_ax.set_ylabel('Singular Value')
     scree_ax.set_title('Singular Values')
@@ -421,7 +417,7 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     sum_s2_top = np.sum(s[:n_top] ** 2)
     alpha = np.sqrt((target_variance * sum_s2_total) / sum_s2_top) if sum_s2_top > 0 else 1.0
 
-    V_top = svd.components_[:n_top, :]
+    V_top = svd_optimal.components_[:n_top, :]
     A_top = A @ V_top.T
     A_pca_scaled = A_top * alpha
 
@@ -653,8 +649,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                     f"{', '.join(important_kmers)}\n"
                     f"Lowest kmers: {', '.join(important_lowest)}\n"
                     f"Highest kmers: {', '.join(important_highest)}\n")
-    if w_selected != None and reverse_dict:
-        with open("kmer_weight.tsv", "w") as f:
+    if (w_selected is not None) and reverse_dict:
+        with open(f"{out_dir}/kmer_weight.tsv", "w") as f:
             f.write("kmer\tweight\n")
             for i in range(len(w_selected)):
                 f.write(f"{inversa(int(i), reverse_dict)}\t{w_selected[i]}\n")
@@ -761,7 +757,6 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
 
     if out_dir is not None:
         plot_weights(weight_vector_selected[final_local], out_dir, trait_name=f'{label}_selected')
-        np.save(f"reduced_trained_model{label}.npy", trained_model)
     # Return your new full-sized sparse model instead of the truncated one
     return trained_model, final_original_idx, lowest_idx, highest_idx
 
@@ -785,25 +780,9 @@ def classify_new_sequences(A, sequences, trained_vector, threshold, trait=None, 
 # Phylogenetics
 # ---------------------------------------------------------------------------
 
-def neighbor_join_reduced(A, sample_labels, target_variance=0.90):
-    max_components = max(1, min(A.shape[0], A.shape[1]) - 1)
-    cum = [0]
-    limit = 200
-    while cum[-1] < target_variance:
-        cap = min(max_components, limit)
-        svd = TruncatedSVD(n_components=cap, random_state=42)
-        Z = svd.fit_transform(A)                      # U * Sigma, already computed
-        cum = np.cumsum(svd.explained_variance_ratio_)
-        if cum[-1] < target_variance:
-            print("target not reached with", cap, "components")   # or double cap and refit
-            limit = 2 * limit
-        if limit >= max_components:
-            break
-    else:
-        optimal_k = int(min(np.searchsorted(cum, target_variance) + 1, cap))
-        A_k = Z[:, :optimal_k]                        # no second fit
+def neighbor_join_reduced(A, sample_labels):
 
-    dist_condensed = pdist(A_k, metric='cosine')
+    dist_condensed = pdist(A, metric='cosine')
     square_form = squareform(dist_condensed)
 
     # Biopython's DistanceMatrix wants a lower-triangular "ragged" matrix:
@@ -1082,9 +1061,9 @@ def parse_node_classification_file(path):
             if "node_" in line:
                 node_label = line
                 new_node = True
-                all_kmers = lines[i+1].strip().split(",")
-                lowest_kmers = lines[i+3].strip().split(",")
-                highest_kmers = lines[i+5].strip().split(",")
+                all_kmers = lines[i+2].strip().split(",")
+                lowest_kmers = lines[i+4].strip().split(",")
+                highest_kmers = lines[i+6].strip().split(",")
 
             if lowest_kmers and highest_kmers and new_node:
                 entries[node_label] = (all_kmers, lowest_kmers, highest_kmers)
@@ -1311,7 +1290,7 @@ def main():
         time_tree = time.time()
         sample_labels = [seq.display_name if seq.display_name else seq.id for seq in sequences]
         if args.bootstraps == 0:
-            tree = neighbor_join_reduced(A, sample_labels)
+            tree = neighbor_join_reduced(A_reduced, sample_labels)
             Phylo.write(tree, os.path.join(out_dir, "tree.newick"), "newick")
             fig, ax = plt.subplots(figsize=(10, 8))
             Phylo.draw(tree, axes=ax, do_show=False)
