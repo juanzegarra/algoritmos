@@ -4,8 +4,6 @@
 #
 #
 ''' 2. Assembly and --classify_assembled crashes
-[ ] Lines 1210–1213: lowest contigs go into the high file and highest into the low file. Swap them.
-[ ] Collision: run_classifier_on_assembly calls evaluate_classifier, which overwrites the real kmer_weight.tsv in the current directory with contig weights. Fixing the per-trait filename (above) resolves this.
 3. Missing implementations
 [ ] Per-node weight files. Node classification saves no kmer_weight table, so node-based --assemble_kmers would hit a KeyError in weight_contigs. Write one weight table per node.
 [ ] Persisting the vocabulary (index_dict).
@@ -1063,12 +1061,12 @@ def run_classifier_on_assembly(assembled, sequences, classifier_method="linear",
             if kmer in seq:
                 A[i, j] = 1
     for i, label_vector in enumerate(labels.T):
-        acc = evaluate_classifier(A, label_vector, out_dir, trait_name=trait_vector[i],
+        acc = evaluate_classifier(A, label_vector, out_dir, trait_name=f"contigs_{trait_vector[i]}",
                                method=classifier_method, test_size=test_size,
                                sample_ids=[seq.display_name if seq.display_name else seq.id for seq in sequences],
-                               weight_reduction=weight_reduction, k=k, reverse_dict=reversed)
+                               weight_reduction=weight_reduction, k=k, reverse_dict=reversed, )
 
-        print(f"Accuracy on trait {trait_vector[i]}: {acc}")
+        print(f"Accuracy on trait's contigs {trait_vector[i]}: {acc}")
 
 def parse_assembled_file(path):
     """Parse the fasta assembled contigs file"""
@@ -1229,9 +1227,9 @@ def main():
             with open(f"{fasta_path}_all_kmers.fasta", "w") as all, open(f"{fasta_path}_highest_kmers.fasta", "w") as high, open(f"{fasta_path}_lowest_kmers.fasta", "w") as low:
                 for i, contig in enumerate(contigs):
                     all.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
-                for i, contig in enumerate(lowest_contigs):
-                    high.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
                 for i, contig in enumerate(highest_contigs):
+                    high.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
+                for i, contig in enumerate(lowest_contigs):
                     low.write(f">{safe_label}_contig_{i}\t(total weight: ){contig_weight_dict[contig]}\n{contig}\n")
             print(f"  {label}: {len(kmers)} k-mer(s) -> {len(contigs)} contig(s) -> {fasta_path}")
 
