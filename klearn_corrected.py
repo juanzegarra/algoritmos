@@ -1,21 +1,51 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-=======
->>>>>>> c2db774 (Update klearn_corrected.py)
-# Implementar paralelismo no classificador dos nós
-# Paralelismo no bootstrap das árvores
-# Fazer plot do P(x) ordenado cor diferente para os labels
-# Aumentar numero de kmers para classificação
-# Retornar kmers dos labels
-# Kmer = 4
-<<<<<<< HEAD
->>>>>>> c40fdf2 (altered klearn)
-=======
->>>>>>> c2db774 (Update klearn_corrected.py)
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
+# new seq classifcation -> find a way to parse several sequences for classification without breaking ram and parallelizing classifcation
+# 2.(sen.spec)/sen+spec
+# gavish donoho
+#
+#
+''' 2. Assembly and --classify_assembled crashes
+[ ] parse_node_classification_file (lines 1066–1091):
+The writer (line 1338) emits 7 lines per node: label, all_kmers, list, lowest_kmers, list, highest_kmers, list.
+The parser reads offsets +1, +3, +5, which are the literal header words. The lists are at +2, +4, +6.
+It detects a node with "node_" in line. Biopython’s NJ names inner nodes Inner1, Inner2, and so on, so it matches nothing; it only matches the node_<id> fallback.
+Simplest fix: write one TSV line per node, label<TAB>all<TAB>lowest<TAB>highest with comma-separated lists, and parse by splitting.
+[ ] Line 1194: for kmer, lowest, highest in kmers: iterates over a single 3-tuple and unpacks each list into three names. Use kmer, lowest, highest = kmers.
+[ ] Line 1202: the three weight_contigs(...) calls have their arguments in the wrong order. The signature is (kmer_weight_dict, k, contigs).
+[ ] Line 1207: high and low are opened without "w", which raises FileNotFoundError.
+[ ] Lines 1210–1213: lowest contigs go into the high file and highest into the low file. Swap them.
+[ ] run_classifier_on_assembly, line 1034: np.matrix makes label_vector a 1×n matrix, so evaluate_classifier fails on indexing. Use np.array([s.anno for s in sequences]); labels.T then iterates correctly.
+[ ] Line 1354: --classify_assembled silently does nothing without --anno, and it only runs after the full pipeline. Print a message, and ideally make it runnable on its own.
+[ ] Collision: run_classifier_on_assembly calls evaluate_classifier, which overwrites the real kmer_weight.tsv in the current directory with contig weights. Fixing the per-trait filename (above) resolves this.
+3. Missing implementations
+[ ] Per-node weight files. Node classification saves no kmer_weight table, so node-based --assemble_kmers would hit a KeyError in weight_contigs. Write one weight table per node.
+[ ] Persisting the vocabulary (index_dict).
+write_index_file isn’t called anywhere.
+front_encoding indexes a dict_keys object, loops with for j in len(...), skips the last element and appends repeatedly.
+front_decoding never returns.
+write_index_file also writes a list to a text file.
+There is no reader.
+A plain sorted k-mer list, one per line and gzipped, is enough. The line number is the column. Front coding is optional compression on top.
+[ ] New-sequence classification (your top TODO). --trained_model and classify_new_sequences exist but nothing connects them. You need:
+A CLI input for the new FASTA.
+Saved weights, vocabulary and decision threshold from training (only the weights are saved today).
+A loader that maps new k-mers onto training columns and drops unseen ones.
+Batches that are k-merized, multiplied by the weights and written out, with the chunks parallelized.
+classify_new_sequences should check dimensions before the matrix multiply, write to out_dir, and fix the classifcation typo. Its header says “logit_score” but it writes probabilities.
+[ ] Gavish–Donoho in the tree step. singular() uses optht but neighbor_join_reduced still targets 90% variance, so the two disagree.
+[ ] Weight reduction for logreg is ignored in evaluate_classifier, with a printed note. Implement it if you want it.
+4. Logic problems that won’t crash
+[ ] Threshold leakage. The sensitivity×specificity threshold is chosen on the test set (lines 557–562 and 576–581). Choose it on the training split or by cross-validation.
+[ ] Line 567: scores_all = sigmoid(A @ w) uses the unreduced w while the test set uses w_selected.
+[ ] roc_curve with a single class in y_test gives NaNs. Guard it.
+[ ] reduce_weights returns lowest_idx/highest_idx from the first-stage ranking, so they aren’t guaranteed to match the final selection order.
+[ ] G = A @ A.T is in int32, so large counts could overflow. Cast to float64.
+[ ] optht assumes roughly iid noise, and raw k-mer counts violate that. Normalize or variance-stabilize first, or treat the cutoff as approximate.
+5. Cleanup
+[ ] Remove dead code: build_vectors_from_dict, create_sample_index, criapos, the unused explained_variance, and the seqObject.kmerize method.
+[ ] Stop shadowing the built-ins all and reversed.
+[ ] Move the scipy imports to the top, and drop the import scipy.sparse as sp inside main.
+[ ] Only X is filtered as an invalid residue. B, Z, U, O, * and - become features.
+[ ] --fasta isn’t required. A missing file is handled, but keep it optional only for assemble mode.'''
 
 """
 klearn.py
@@ -63,7 +93,6 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from pandas.core.indexes.category import NDArrayBackedExtensionIndex
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3D projection)
 
@@ -74,17 +103,10 @@ from Bio.Phylo.Consensus import majority_consensus
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse import eye, bmat
 from scipy.sparse.linalg import spsolve
-<<<<<<< HEAD
-<<<<<<< HEAD
 from scipy.sparse import csr_matrix
+from optht import optht
 
-=======
-import scipy.io
->>>>>>> 7fb6579 (Update klearn_corrected.py)
-=======
-from scipy.sparse import csr_matrix
 
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
 from sklearn.decomposition import TruncatedSVD
 from sklearn.cluster import KMeans
@@ -159,9 +181,6 @@ def parse_args():
     parser.add_argument('--kmer_weights_file', type=str, default=None, metavar='PATH',
                         help='File output by weight reduction that is used to return'
                             'the summation of weight values during assembly.')
-    parser.add_argument('--classify_seqs', action="store_true", help='Turns on mode for classification of new sequences based on already trained vertor' +
-        '(fasta input is sent through positional input)')
-    parser.add_argument('--id_mapping', type=str, default=None, metavar="PATH", help='Id mapping file to create vectors for new fastas')
 
 
     return parser.parse_args()
@@ -327,7 +346,7 @@ def create_annotation_vector(sequences):
         matrix[i] = seq.anno
     return matrix
 
-def montaA(sequencias, outdir=None):
+def montaA(sequencias):
     """Build the sample x feature matrix A.
     - The feature space (VALID_AA_COUNT**k columns) is far too large
       to store densely, so only k-mers actually OBSERVED across the dataset
@@ -359,24 +378,52 @@ def montaA(sequencias, outdir=None):
         dtype=np.int32
     ).tocsc()
 
-
-    with open(f"{outdir}/index_kmers_dict.tsv", "w") as f:
-        for kmer, i in index_dict.items():
-            f.write(f"{kmer}\t{i}\n")
-
     return a, index_dict
 
+def write_index_file(index_dict, out_dir=None):
+    os.makedirs(out_dir, exist_ok=True)
+    encoded_l = front_encoding(index_dict.keys())
+    with open(f"{out_dir}/index.f", "w") as f:
+        f.write(encoded_l)
 
+# Use front encoding to compress index list of kmers
+def front_encoding(l):
+    encoded_l = []
+    for i in range(len(l) - 1):
+        if i == 0:
+            encoded_l.append((0, l[i]))
+        for j in len(l[i]):
+            if l[i][j] == l[i+1][j]:
+                continue
+            else:
+                encoded_l.append((j, l[i+1][j:]))
+    return encoded_l
+
+# Decompress the front enconded text
+def front_decoding(l):
+    decoded_l = []
+    for i in range(len(l) - 1):
+        if i == 0:
+            decoded_l.append(l[i][1])
+        prefix = l[i][1][:l[i+1][0]]
+        next_entry = prefix + l[i+1][1]
+        decoded_l.append(next_entry)
+
+def build_vectors_from_dict(sequencias, index_dict):
+    list_of_indices = []
+    for seq in sequencias:
+        indices = [index_dict[kmer] for kmer in seq.kmer_vector]
+        list_of_indices.append(indices)
+    return list_of_indices
 
 # ---------------------------------------------------------------------------
 # Feature matrix / dimensionality reduction / clustering
 # ---------------------------------------------------------------------------
 
-
 def create_sample_index(sequences):
     return {seq.id: seq for seq in sequences}
 
-
+from scipy.linalg import eigh
 def singular(A, out_dir, labels=None, target_variance=0.70):
     """Truncated SVD dimensionality reduction. Returns:
        - A_pca_scaled: samples projected onto the top-3 components, scaled so
@@ -385,29 +432,26 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
        - A_k: samples projected onto the smallest number of components whose
          cumulative explained variance reaches `target_variance`.
     A 3D scatter plot of A_pca_scaled is saved to out_dir/pca_scaled.png."""
-    max_components = max(1, min(A.shape[0], A.shape[1]) - 1)
+    m, n = A.shape
 
-    svd = TruncatedSVD(n_components=max_components, random_state=42)
-    svd.fit(A)
-
-    cumulative_variance = np.cumsum(svd.explained_variance_ratio_)
-    reached = np.argmax(cumulative_variance >= target_variance)
-    if cumulative_variance[reached] < target_variance:
-        print(f"Warning: target variance {target_variance:.0%} not reached with "
-              f"{max_components} components (max cumulative = "
-              f"{cumulative_variance[-1]:.2%}). Using all available components.")
-    optimal_k = min(reached + 1, max_components)
+    G = (A @ A.T).toarray()
+    ev = eigh(G, eigvals_only=True)[::-1]
+    svs = np.sqrt(np.maximum(ev, 0.0))
+    beta = min(m, n) / max(m, n)
+    optimal_k = optht(beta, svs)
+    optimal_k = max(int(optimal_k), 1)
 
     svd_optimal = TruncatedSVD(n_components=optimal_k, random_state=42)
     A_k = svd_optimal.fit_transform(A)
 
-    s = svd.singular_values_
+    s = svd_optimal.singular_values_
     sum_s2_total = np.sum(s ** 2)
-    n_top = min(3, max_components)
-    explained_variance = np.sort(svd.explained_variance_ratio_)
+    n_top = min(3, A_k.shape[1])
+    explained_variance = np.sort(svd_optimal.explained_variance_ratio_)
+    cumulative_variance = np.cumsum(ev) / ev.sum()
 
     scree_fig, scree_ax = plt.subplots(figsize=(10, 6))
-    scree_ax.plot(explained_variance, 'o-')
+    scree_ax.plot(s, 'o-')
     scree_ax.set_xlabel('Singular Value Index')
     scree_ax.set_ylabel('Singular Value')
     scree_ax.set_title('Singular Values')
@@ -417,7 +461,7 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     sum_s2_top = np.sum(s[:n_top] ** 2)
     alpha = np.sqrt((target_variance * sum_s2_total) / sum_s2_top) if sum_s2_top > 0 else 1.0
 
-    V_top = svd.components_[:n_top, :]
+    V_top = svd_optimal.components_[:n_top, :]
     A_top = A @ V_top.T
     A_pca_scaled = A_top * alpha
 
@@ -475,12 +519,11 @@ def run_kmeans(A_reduced, n_clusters, out_dir):
 # ---------------------------------------------------------------------------
 
 from scipy.linalg import solve
-# Dual system solution for weight values of the linear regression
 def resolve2(A, b):
     Af = A.astype(np.float64)
-    # Create Gram matrix in the reduced sample space, adds the identity for ridge regularization
     G = (Af @ Af.T).toarray() + np.eye(A.shape[0])
     return Af.T @ solve(G, b, assume_a='pos')
+
 
 def fit_linear_classifier(A, indicadores, method='linear'):
     """Fit a linear classifier and return a per-feature weight vector `w`
@@ -497,10 +540,6 @@ def fit_linear_classifier(A, indicadores, method='linear'):
         raise ValueError(f"Unknown classifier method: {method}")
 
 # plot the feature weights
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 def plot_weights(w, out_dir, trait_name='trait'):
     """Scatter plot of a classifier's per-feature weights, sorted ascending.
     Saved to out_dir/<trait_name>_weights.png -- pass a distinct
@@ -516,52 +555,16 @@ def plot_weights(w, out_dir, trait_name='trait'):
     safe_name = "".join(c if c.isalnum() else "_" for c in trait_name)
     fig.savefig(os.path.join(out_dir, f'{safe_name}_weights.png'))
     plt.close(fig)
-<<<<<<< HEAD
-=======
-def plot_weights(w, out_dir=None, trait_name='trait'):
-    w = np.sort(w)
-    plt.figure()
-    plt.plot(range(len(w)), w, "*", s=10)
-    plt.xlabel('Feature')
-    plt.ylabel('Weight')
-    plt.title(f'Feature weights for {trait_name}')
-    plt.savefig(os.path.join(out_dir, f'{trait_name}_weights.png'))
-    plt.close()
->>>>>>> c40fdf2 (altered klearn)
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
 
 # kept for backwards compatibility with the original function name
 def logistica(A, indicadores):
     return fit_linear_classifier(A, indicadores, method='linear')
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
 ## Change this function to accept weight reduction and refitting
 def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
                          test_size=0.25, random_state=42, sample_ids=None,
                          weight_reduction=None, k=None, reverse_dict=None):
-=======
-
-## Change this function to accept weight reduction and refitting
-def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
-=======
-
-## Change this function to accept weight reduction and refitting
-def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
->>>>>>> c2db774 (Update klearn_corrected.py)
-                         test_size=0.25, random_state=42, w=None):
-    """Train/test split, fit `method` classifier, and save a figure with a
-    confusion matrix and ROC curve to out_dir. Returns test accuracy."""
->>>>>>> c40fdf2 (altered klearn)
-=======
-## Change this function to accept weight reduction and refitting
-def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='logreg',
-                         test_size=0.25, random_state=42, sample_ids=None,
-                         weight_reduction=None, k=None, reverse_dict=None):
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
     indicadores = np.asarray(indicadores)
     idx_all = np.arange(A.shape[0])
     w_selected = None
@@ -577,11 +580,6 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             idx_all, test_size=test_size, random_state=random_state
         )
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
     X_train, X_test = A[idx_train], A[idx_test]
     y_train, y_test = indicadores[idx_train], indicadores[idx_test]
 
@@ -603,7 +601,7 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         # Find best threshold value for maximizing specifity and sensitivity product
         fpr, tpr, thresholds = roc_curve(y_test, scores_test)
         specificity = 1 - fpr
-        harmonic_avr = 2 * (specificity * tpr) / tpr + specificity
+        harmonic_avr = (specificity * tpr) / (specificity + tpr)
 
         optimal_idx = np.argmax(harmonic_avr)
         best_threshold = thresholds[optimal_idx]
@@ -622,9 +620,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         # Find best threshold value for maximizing specifity and sensitivity product
         fpr, tpr, thresholds = roc_curve(y_test, scores_test)
         specificity = 1 - fpr
-        area = specificity * tpr
+        harmonic_avr = (specificity * tpr) / (specificity + tpr)
 
-        optimal_idx = np.argmax(area)
+        optimal_idx = np.argmax(harmonic_avr)
         best_threshold = thresholds[optimal_idx]
 
         y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
@@ -633,19 +631,6 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         scores_all = sigmoid(A @ w)
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
-<<<<<<< HEAD
-=======
-=======
->>>>>>> c2db774 (Update klearn_corrected.py)
-    if method == 'linear':
-        if w is None:
-            w = fit_linear_classifier(X_train, y_train, method='linear')
-        w_red, kmer_idx = reduce_weights(A, w, indicadores, classifier='linear', out_dir=out_dir)
-        scores_test = X_test @ w_red
-        y_pred = np.where(scores_test >= 0, 1, 0)
->>>>>>> c40fdf2 (altered klearn)
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
     elif method == 'logreg':
         if weight_reduction is not None:
             print(f"Note: --weight_reduction only applies to --classifier linear; "
@@ -708,8 +693,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                     f"{', '.join(important_kmers)}\n"
                     f"Lowest kmers: {', '.join(important_lowest)}\n"
                     f"Highest kmers: {', '.join(important_highest)}\n")
-    if w_selected != None and reverse_dict:
-        with open("kmer_weight.tsv", "w") as f:
+    if (w_selected is not None) and reverse_dict:
+        with open(f"{out_dir}/kmer_weight.tsv", "w") as f:
             f.write("kmer\tweight\n")
             for i in range(len(w_selected)):
                 f.write(f"{inversa(int(i), reverse_dict)}\t{w_selected[i]}\n")
@@ -719,6 +704,13 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all", best_threshold=best_threshold or 0.5)
 
     return accuracy
+
+def coordinate_compression(l):
+    compressed_data = set(l)
+    rows, columns = [], []
+
+    for i in range(len(l)):
+
 
 def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name, best_threshold=0.5):
     y_true = np.asarray(y_true)
@@ -809,9 +801,22 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
 
     if out_dir is not None:
         plot_weights(weight_vector_selected[final_local], out_dir, trait_name=f'{label}_selected')
-        np.save(f"reduced_trained_model{label}.npy", trained_model)
     # Return your new full-sized sparse model instead of the truncated one
     return trained_model, final_original_idx, lowest_idx, highest_idx
+
+def classify_new_sequences(A, sequences, trained_vector, threshold, trait=None, model_name=None):
+    A_predictions = A @ trained_vector
+    seq_scores = sigmoid(A_predictions)
+    seq_classification = np.where(seq_scores < threshold, 0, 1)
+    if len(sequences) != len(seq_classification):
+        print("Trained vector and sequences do not match dimensions, exiting...")
+        return
+    else:
+        with open(f"model_classifcation{trait}.txt", "w") as f:
+            f.write(f"#CLASSIFICATIONS RETURNED BY MODEL {model_name} threshold value {threshold}\nID\tlogit_score\tclassifcation\n")
+            for i in range(len(sequences)):
+                    f.writelines(f"{sequences[i].id}\t{seq_scores[i]}\t{seq_classification[i]}\n")
+
 
 
 
@@ -819,25 +824,9 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
 # Phylogenetics
 # ---------------------------------------------------------------------------
 
-def neighbor_join_reduced(A, sample_labels, target_variance=0.90):
-    max_components = max(1, min(A.shape[0], A.shape[1]) - 1)
-    cum = [0]
-    limit = 200
-    while cum[-1] < target_variance:
-        cap = min(max_components, limit)
-        svd = TruncatedSVD(n_components=cap, random_state=42)
-        Z = svd.fit_transform(A)                      # U * Sigma, already computed
-        cum = np.cumsum(svd.explained_variance_ratio_)
-        if cum[-1] < target_variance:
-            print("target not reached with", cap, "components")   # or double cap and refit
-            limit = 2 * limit
-        if limit >= max_components:
-            break
-    else:
-        optimal_k = int(min(np.searchsorted(cum, target_variance) + 1, cap))
-        A_k = Z[:, :optimal_k]                        # no second fit
+def neighbor_join_reduced(A, sample_labels):
 
-    dist_condensed = pdist(A_k, metric='cosine')
+    dist_condensed = pdist(A, metric='cosine')
     square_form = squareform(dist_condensed)
 
     # Biopython's DistanceMatrix wants a lower-triangular "ragged" matrix:
@@ -1097,7 +1086,7 @@ def parse_assembled_file(path):
 
 def parse_node_classification_file(path):
     """Parse a node_classification.txt file (one line per tree node:
-    `node_label\nkmer1,kmer2,...\n lowest_kmers\n kmer1,kmer2,...\n highest_kmers\nkmer1,kmer2,...`, as written by the --classify_nodes
+    `node_label<TAB>kmer1,kmer2,...\n lowest_kmers\n highest_kmers`, as written by the --classify_nodes
     report). Returns {node_label: (kmers, lowest_kmers, highest_kmers)}, skipping any node with an
     empty k-mer list."""
     entries = {}
@@ -1116,9 +1105,9 @@ def parse_node_classification_file(path):
             if "node_" in line:
                 node_label = line
                 new_node = True
-                all_kmers = lines[i+1].strip().split(",")
-                lowest_kmers = lines[i+3].strip().split(",")
-                highest_kmers = lines[i+5].strip().split(",")
+                all_kmers = lines[i+2].strip().split(",")
+                lowest_kmers = lines[i+4].strip().split(",")
+                highest_kmers = lines[i+6].strip().split(",")
 
             if lowest_kmers and highest_kmers and new_node:
                 entries[node_label] = (all_kmers, lowest_kmers, highest_kmers)
@@ -1159,42 +1148,6 @@ def parse_trait_report_file(path):
 
     return trait_name, None
 
-def classify_new_seqs(sequences, trained_vector, k, id_mapping_dict, threshold=0.5,model_name=None):
-
-    seqs = [seq.seq for seq in sequences]
-    seen_kmers = set(id_mapping_dict.keys())
-    for seq in seqs:
-        kmer_vector = defaultdict(int)
-        for j in range(len(seq) - k + 1):
-            if seq[j:j+k] in seen_kmers:
-                kmer_vector[seq[j:j+k]] += 1
-            seq.kmer_vector = kmer_vector
-
-    rows, columns, data = [], [], []
-    for i, seq in enumerate(seqs):
-        for kmer, count in seq.kmer_vector.items():
-            rows.append(i)
-            columns.append(id_mapping_dict[kmer])
-            data.append(count)
-
-    A = csr_matrix(
-    (data, (rows, columns)),
-    shape=(len(seqs), len(seen_kmers)),
-    dtype=np.int32
-).tocsc()
-
-    A_predictions = A @ trained_vector
-    seq_scores = sigmoid(A_predictions)
-    seq_classification = np.where(seq_scores < threshold, 0, 1)
-    if len(sequences) != len(seq_classification):
-        print("Trained vector and sequences do not match dimensions, exiting...")
-        return
-    else:
-        with open(f"model_classifcation{trait}.txt", "w") as f:
-            f.write(f"#CLASSIFICATIONS RETURNED BY MODEL {model_name} threshold value {threshold}\nID\tlogit_score\tclassifcation\n")
-            for i in range(len(sequences)):
-                    f.writelines(f"{sequences[i].id}\t{seq_scores[i]}\t{seq_classification[i]}\n")
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1219,25 +1172,6 @@ def main():
     test_size = args.test_size
     weight_reduction = args.weight_reduction
     kmer_weight = args.kmer_weights_file
-    classify_mode=args.classify_seqs
-    id_mapping_file=args.id_mapping
-    trained_vector=args.trained_model
-
-    if classify_mode:
-        if not os.path.isfile(id_mapping_file):
-            print("Non-existant id mapping file")
-            return
-        if not os.path.isfile(args.fasta):
-            print("Non-existant fasta input, check name and/or path")
-            return
-        if not os.path.isfile(trained_vector):
-            print("Non-exis")
-        sequences = SeqIO.parse(args.fasta, "fasta")
-<<<<<<< HEAD
-        classify_new_seqs(sequences, trained_vector, k, id_mapping_file)
-=======
-        classify_new_seqs(sequences, trained_vector)
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
     # Assemble k-mers from a file (or directory) produced by an earlier run's
     # --classify_nodes / --anno + --weight_reduction reports. This is a
@@ -1362,10 +1296,11 @@ def main():
     print(f"K-merization time: {time_kmerization:.2f} seconds")
 
     # 4. Build feature matrix
-    A, index_dict = montaA(sequences, out_dir)
+    A, index_dict = montaA(sequences)
     reverse_dict = inversa_k(index_dict)
     import scipy.sparse as sp
     sp.save_npz(os.path.join(out_dir, "feature_matrix.npz"), A)
+
 
     # 5. SVD / PCA visualization
     time_visualization = time.time()
@@ -1381,11 +1316,6 @@ def main():
 
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
         display_ids = [s.display_name if s.display_name else s.id for s in sequences]
         for t_idx, trait_name in enumerate(trait_names):
             y = annotation_matrix[:, t_idx]
@@ -1397,25 +1327,6 @@ def main():
                                        sample_ids=display_ids,
                                        weight_reduction=weight_reduction, k=k ,reverse_dict=reverse_dict)
             print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
-<<<<<<< HEAD
-=======
-=======
->>>>>>> c2db774 (Update klearn_corrected.py)
-        with open(os.path.join(out_dir, "important_kmers_annotation.txt"), "w") as f:
-            for t_idx, trait_name in enumerate(trait_names):
-                y = annotation_matrix[:, t_idx]
-                if len(np.unique(y)) < 2:
-                    print(f"Skipping trait '{trait_name}': only one class present.")
-                    continue
-                acc = evaluate_classifier(A, y, out_dir, trait_name=trait_name,
-                                           method=classifier_method, test_size=test_size)
-                print(f"Trait '{trait_name}': test accuracy = {acc:.4f}")
-<<<<<<< HEAD
->>>>>>> c40fdf2 (altered klearn)
-=======
->>>>>>> c2db774 (Update klearn_corrected.py)
-=======
->>>>>>> ca3fa9a (changed several functions, changed resolve for dual space solution, beginned adding gavish donoho)
 
     # 8. Phylogenetics
     tree = None
@@ -1423,7 +1334,7 @@ def main():
         time_tree = time.time()
         sample_labels = [seq.display_name if seq.display_name else seq.id for seq in sequences]
         if args.bootstraps == 0:
-            tree = neighbor_join_reduced(A, sample_labels)
+            tree = neighbor_join_reduced(A_reduced, sample_labels)
             Phylo.write(tree, os.path.join(out_dir, "tree.newick"), "newick")
             fig, ax = plt.subplots(figsize=(10, 8))
             Phylo.draw(tree, axes=ax, do_show=False)
@@ -1468,18 +1379,12 @@ def main():
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
     # Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
-    if args.classify_assembled:
-        if not sequences:
-            print("Lacking fasta file with sequences for assembly classification")
-            return
-        if not trait_names:
-            print("Lacking annotation for assembly classification")
-            return
+    if args.classify_assembled and sequences and trait_names:
         if os.path.isfile(args.classify_assembled):
             assembled = parse_assembled_file(args.classify_assembled)
             if not os.path.isdir(f"{out_dir}/assembly_classification"):
                 os.makedirs(f"{out_dir}/assembly_classification", exist_ok=True)
-            run_classifier_on_assembly(assembled, sequences, classifier_method=classifier_method, out_dir=f"{out_dir}/assembly_classification", trait_vector=trait_names)
+            run_classifier_on_assembly(assembled, sequences, classifier_method=classifier_method, out_dir=f"{out_dir}/assembly_classification", trait_vector=trait_names, weight_reduction=weight_reduction, k=k)
         else:
             print(f"Assembled kmers file not found: {args.classify_assembled}")
 
