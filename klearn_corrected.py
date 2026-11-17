@@ -53,7 +53,7 @@ klearn.py
 Pipeline for protein sequence classification and phylogenetics based on
 k-mer composition.
 
-Two independent (and combinable) modes:
+Three independent modes:
 
   * Annotation-based classification (--anno FILE): trains a classifier per
     trait column in the annotation file and reports test accuracy, a
@@ -64,6 +64,9 @@ Two independent (and combinable) modes:
     (clade), fits a linear classifier that predicts clade membership from
     k-mer features -- no external annotation file needed, since the labels
     come from the tree topology itself.
+
+  * Classification of new sequences using a trained model object returned by
+    classification
 
 At least one of the two modes must be requested. They can also be combined
 in the same run.
