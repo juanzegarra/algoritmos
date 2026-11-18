@@ -2,7 +2,7 @@
 # 2.(sen.spec)/sen+spec
 # gavish donoho
 #
-# B Z J are not valid aa and ae not filtered
+# B Z J are not valid aa and are not filtered
 '''
 3. Missing implementations
 
@@ -14,10 +14,8 @@ Batches that are k-merized, multiplied by the weights and written out, with the 
 classify_new_sequences should check dimensions before the matrix multiply, write to out_dir, and fix the classifcation typo. Its header says “logit_score” but it writes probabilities.
 [ ] Weight reduction for logreg is ignored in evaluate_classifier, with a printed note. Implement it if you want it.
 4. Logic problems that won’t crash
-[ ] Line 567: scores_all = sigmoid(A @ w) uses the unreduced w while the test set uses w_selected.
 [ ] roc_curve with a single class in y_test gives NaNs. Guard it.
 [ ] reduce_weights returns lowest_idx/highest_idx from the first-stage ranking, so they aren’t guaranteed to match the final selection order.
-[ ] G = A @ A.T is in int32, so large counts could overflow. Cast to float64.
 [ ] optht assumes roughly iid noise, and raw k-mer counts violate that. Normalize or variance-stabilize first, or treat the cutoff as approximate.
 5. Cleanup
 [ ] Remove dead code: build_vectors_from_dict, create_sample_index, criapos, the unused explained_variance, and the seqObject.kmerize method.
@@ -110,9 +108,9 @@ DEFAULT_N_WEIGHTS = 20  # top/bottom N features kept per side when reducing weig
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Classification and phylogenetics of protein sequences from k-mer '
-                     'composition. Two modes are available and can be combined: annotation-'
+                     'composition. Three modes are available and can be combined: annotation-'
                      'based classification (--anno) and/or tree-based node classification '
-                     '(--phylo --classify_nodes).'
+                     '(--phylo --classify_nodes), and new sequence classifcation, (--classify)'
     )
     parser.add_argument('--fasta', '-f', type=str,
                          help='FASTA file with protein sequences.')
@@ -161,10 +159,10 @@ def parse_args():
                               'trait/node found. Does not require --anno or --phylo.')
     parser.add_argument('--classify_assembled', type=str, default=None, metavar='PATH',
                          help='Classify assembled contigs using the classifier trained on the full dataset.')
-    parser.add_argument('--trained_model', type=str, default=None, metavar='PATH', help='Vector output by trained model (e.g. trained_model.npy)')
-    parser.add_argument('--kmer_weights_file', type=str, default=None, metavar='PATH',
+    parser.add_argument('--trained_vector', type=str, default=None, metavar='PATH',
                         help='File output by weight reduction that is used to return'
                             'the summation of weight values during assembly.')
+    parser.add_argument('--classify', default=None, action='store_true')
 
 
     return parser.parse_args()
@@ -526,7 +524,7 @@ def run_kmeans(A_reduced, n_clusters, out_dir):
 from scipy.linalg import solve
 def resolve2(A, b):
     Af = A.astype(np.float64)
-    G = (Af @ Af.T).toarray() + np.eye(A.shape[0])
+    G = (Af @ Af.T).toarray().astype(np.float64) + np.eye(A.shape[0])
     return Af.T @ solve(G, b, assume_a='pos')
 
 
@@ -809,7 +807,7 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
     # Return your new full-sized sparse model instead of the truncated one
     return trained_model, final_original_idx, lowest_idx, highest_idx
 
-def classify_new_sequences(A, sequences, trained_vector, threshold, trait=None, model_name=None):
+def classify_new_sequences(A, sequences, trained_vector, threshold, k,trait=None, model_name=None):
     A_predictions = A @ trained_vector
     seq_scores = sigmoid(A_predictions)
     seq_classification = np.where(seq_scores < threshold, 0, 1)
@@ -822,6 +820,24 @@ def classify_new_sequences(A, sequences, trained_vector, threshold, trait=None, 
             for i in range(len(sequences)):
                     f.writelines(f"{sequences[i].id}\t{seq_scores[i]}\t{seq_classification[i]}\n")
 
+def vectorize_new(seq : str, weight_dict, k):
+    prev_kmers = set(weight_dict.keys())
+    seq_bytes = seq.encode("ascii")
+    mv = memoryview(seq_bytes)
+    count = 0
+    for i in range(len(seq)-k + 1):
+        mv[i:i+k]
+        if
+
+
+
+def vectorization_worker(batch):
+    vectors = []
+
+    for record in batch:
+        id = record.id
+        seq = str(record.seq)
+        vectorize_new()
 
 
 
@@ -970,17 +986,36 @@ def write_weight_file(weights, reverse_dict, trait=None, outdir=None, threshold=
         for index, weight in enumerate(weights):
             f.write(f"{reverse_dict[index]}\t{weight}")
 
-def read_weight_file()
+def read_weight_file(weight_file):
+
+    if not os.path.isfile(weight_file):
+        print("Could not find kmer-weight file, please check path or name.")
+        return
+
+    with gzip.open(weight_file, "r") as f:
+        line1 = f.readline()
+        try:
+            threshold = float(line1.strip())
+        except:
+            print("Malformatted weight file, could not retrive optimal threshold.")
+            return
+
+        try:
+            kmer_weight_df = pd.read_csv(weight_file, sep="\t")
+            kmer_weight_dict = kmer_weight_df.set_index(kmer_weight_df.columns[0])[kmer_weight_df.columns[1]].to_dict()
+
+        except:
+            print("Malformatted weight file, could not retrive table.")
+            return
+
+    return kmer_weight_dict, threshold
+
+
 
 # ---------------------------------------------------------------------------
 # k-mer assembly
 # ---------------------------------------------------------------------------
 
-# Read tsv file that maps each kmer to its value learned from classification
-def parse_kmer_weight_file(weight_kmer_file):
-    kmer_weight_df = pd.read_csv(weight_kmer_file, sep="\t")
-    kmer_weight_dict = kmer_weight_df.set_index(kmer_weight_df.columns[0])[kmer_weight_df.columns[1]].to_dict()
-    return kmer_weight_dict
 
 def assemble_kmers(important_kmers, k):
     """
@@ -1190,19 +1225,19 @@ def main():
     classifier_method = args.classifier
     test_size = args.test_size
     weight_reduction = args.weight_reduction
-    kmer_weight = args.kmer_weights_file
+    trained_vector = args.trained_vector
 
     # Assemble k-mers from a file (or directory) produced by an earlier run's
     # --classify_nodes / --anno + --weight_reduction reports. This is a
     # standalone mode: it does not need --anno or --phylo.
     if assemble_target:
-        if not kmer_weight:
+        if not trained_vector:
             print("Lacking tsv file that maps kmers to their weight")
             return
         time_kmers = time.time()
         print(f"Assembling k-mers from {assemble_target}...")
 
-        kmer_weight_dict = parse_kmer_weight_file(kmer_weight) # kmer -> associated weight returned by classifier
+        kmer_weight_dict, threshold = read_weight_file(trained_vector) # decision threshold and kmer -> associated weight returned by classifier
         kmer_sources = {}  # label -> list of kmer strings for every file (node_classification or classification_report)
 
         if os.path.isdir(assemble_target):
@@ -1405,7 +1440,7 @@ def main():
             f.write(f"tree time\t{time_tree:.2f} seconds\n")
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
-    # Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
+    # 10. Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
     if args.classify_assembled and sequences and trait_names:
 
         if os.path.isfile(args.classify_assembled):
@@ -1422,6 +1457,30 @@ def main():
     elif not sequences:
        print("Missing fasta file with original sequences used for classification, please provide sequence file.")
        return
+
+    # 11. Classify new sequences using a kmer-weight input file
+    # Takes new sequences, vectorizes them using the kmers determined to be important by the classifier
+    # Performs simple dot product between new seq vector and previously found weights
+    # Uses threshhold value information from kmer-weight file to classify
+    # Returns a tsv file with seqID, classification and sigmoid score
+
+    if args.classify:
+        print(f"Beggining to classify sequences from {args.fasta}")
+        if args.phylo or args.anno:
+            print("Incompatible modes, exiting...")
+            return
+
+        if not args.trained_vector:
+            print("Missing trained vector file for classifcation, please input.")
+            return
+
+        trained_vector = args.trained_vector
+        weight_kmer_dict, threshold = read_weight_file(trained_vector)
+        k = len(weight_kemr_dict.keys()[1])
+
+
+
+
 
 if __name__ == '__main__':
     main()
