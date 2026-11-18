@@ -2,27 +2,18 @@
 # 2.(sen.spec)/sen+spec
 # gavish donoho
 #
-#
-''' 2. Assembly and --classify_assembled crashes
+# B Z J are not valid aa and ae not filtered
+'''
 3. Missing implementations
-[ ] Per-node weight files. Node classification saves no kmer_weight table, so node-based --assemble_kmers would hit a KeyError in weight_contigs. Write one weight table per node.
-[ ] Persisting the vocabulary (index_dict).
-write_index_file isn’t called anywhere.
-front_encoding indexes a dict_keys object, loops with for j in len(...), skips the last element and appends repeatedly.
-front_decoding never returns.
-write_index_file also writes a list to a text file.
-There is no reader.
-A plain sorted k-mer list, one per line and gzipped, is enough. The line number is the column. Front coding is optional compression on top.
+
 [ ] New-sequence classification (your top TODO). --trained_model and classify_new_sequences exist but nothing connects them. You need:
 A CLI input for the new FASTA.
 Saved weights, vocabulary and decision threshold from training (only the weights are saved today).
 A loader that maps new k-mers onto training columns and drops unseen ones.
 Batches that are k-merized, multiplied by the weights and written out, with the chunks parallelized.
 classify_new_sequences should check dimensions before the matrix multiply, write to out_dir, and fix the classifcation typo. Its header says “logit_score” but it writes probabilities.
-[ ] Gavish–Donoho in the tree step. singular() uses optht but neighbor_join_reduced still targets 90% variance, so the two disagree.
 [ ] Weight reduction for logreg is ignored in evaluate_classifier, with a printed note. Implement it if you want it.
 4. Logic problems that won’t crash
-[ ] Threshold leakage. The sensitivity×specificity threshold is chosen on the test set (lines 557–562 and 576–581). Choose it on the training split or by cross-validation.
 [ ] Line 567: scores_all = sigmoid(A @ w) uses the unreduced w while the test set uses w_selected.
 [ ] roc_curve with a single class in y_test gives NaNs. Guard it.
 [ ] reduce_weights returns lowest_idx/highest_idx from the first-stage ranking, so they aren’t guaranteed to match the final selection order.
@@ -80,6 +71,7 @@ from multiprocessing import Pool
 import multiprocessing as mp
 import time
 from collections import defaultdict
+import gzip
 
 
 import numpy as np
@@ -309,7 +301,12 @@ def read_annotations(anno_file, sequences):
             continue
 
         if has_display and pd.notna(row.get("Display")):
-            seq_by_id[seq_id].display_name = str(row["Display"])
+            display_name = str(row["Display"])
+            if len(display_name) <= 50:
+                seq_by_id[seq_id].display_name = display_name
+            else:
+                print("Display name with more than 50 chars, exiting")
+                return
 
         try:
             # Extract float values only for actual traits, ignoring 'Display'
@@ -374,21 +371,36 @@ def montaA(sequencias):
 
 def write_index_file(index_dict, out_dir=None):
     os.makedirs(out_dir, exist_ok=True)
-    encoded_l = front_encoding(index_dict.keys())
-    with open(f"{out_dir}/index.f", "w") as f:
+    encoded_l = ",".join(front_encoding(list(index_dict.keys())))
+    with gzip.open(f"{out_dir}/index.f.gz", "w") as f:
         f.write(encoded_l)
+
+def read_index_file(index_file):
+    if not os.path.isfile(index_file):
+        print("Index file not found, please check file path or name.")
+        return
+    index_dict = defaultdict(int)
+    with gzip.open(index_file, "r") as f:
+        line = f.read().strip()
+        line = list(front_decoding(line)).split(",")
+        index_dict = {kmer : i for kmer, i in enumerate(line)}
+
+    return index_dict
 
 # Use front encoding to compress index list of kmers
 def front_encoding(l):
+    if not l:
+        return
     encoded_l = []
-    for i in range(len(l) - 1):
+    for i in range(len(l)-1):
         if i == 0:
             encoded_l.append((0, l[i]))
-        for j in len(l[i]):
+        for j in range(len(l[i])):
             if l[i][j] == l[i+1][j]:
                 continue
             else:
                 encoded_l.append((j, l[i+1][j:]))
+                break
     return encoded_l
 
 # Decompress the front enconded text
@@ -400,6 +412,7 @@ def front_decoding(l):
         prefix = l[i][1][:l[i+1][0]]
         next_entry = prefix + l[i+1][1]
         decoded_l.append(next_entry)
+    return decoded_l
 
 def build_vectors_from_dict(sequencias, index_dict):
     list_of_indices = []
@@ -589,9 +602,10 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
             n_weights=weight_reduction, label=trait_name
         )
 
+        scores_train = sigmoid(X_train @ w_selected)
         scores_test = sigmoid(X_test @ w_selected)
         # Find best threshold value for maximizing specifity and sensitivity product
-        fpr, tpr, thresholds = roc_curve(y_test, scores_test)
+        fpr, tpr, thresholds = roc_curve(y_train, scores_train)
         specificity = 1 - fpr
         harmonic_avr = (specificity * tpr) / (specificity + tpr)
 
@@ -601,16 +615,17 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
 
         # All data predictions
-        scores_all = sigmoid(A @ w)
+        scores_all = sigmoid(A @ w_selected)
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
     elif method == 'linear':
         w = fit_linear_classifier(X_train, y_train, method='linear')
 
         # Test set predictions
+        scores_train = sigmoid(X_train @ w)
         scores_test = sigmoid(X_test @ w)
         # Find best threshold value for maximizing specifity and sensitivity product
-        fpr, tpr, thresholds = roc_curve(y_test, scores_test)
+        fpr, tpr, thresholds = roc_curve(y_train, scores_train)
         specificity = 1 - fpr
         harmonic_avr = (specificity * tpr) / (specificity + tpr)
 
@@ -654,7 +669,7 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     fig.colorbar(im, ax=axes[0])
 
     if len(np.unique(y_test)) > 1:
-        fpr, tpr, _ = roc_curve(y_test, scores_test)
+        fpr, tpr, _ = roc_curve(y_test, scores_test, best_threshold)
         roc_auc = auc(fpr, tpr)
         axes[1].plot(fpr, tpr, label=f'AUC = {roc_auc:.2f}')
         axes[1].plot([0, 1], [0, 1], linestyle='--', color='gray')
@@ -686,11 +701,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                     f"Lowest kmers: {', '.join(important_lowest)}\n"
                     f"Highest kmers: {', '.join(important_highest)}\n")
     if (w_selected is not None) and reverse_dict:
-        with open(f"{out_dir}/kmer_weight.tsv", "w") as f:
-            f.write("kmer\tweight\n")
-            for i in range(len(w_selected)):
-                f.write(f"{inversa(int(i), reverse_dict)}\t{w_selected[i]}\n")
-
+        write_weight_file(w_selected, reverse_dict, trait= trait_name, threshold=best_threshold)
+    elif (w is not None and w_selected is None) and reverse_dict:
+        write_weight_file(w, reverse_dict, trait= trait_name, threshold=best_threshold)
     # Generate two plots: one strictly for the test partition, one for the whole dataset
     plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test", best_threshold=best_threshold or 0.5)
     plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all", best_threshold=best_threshold or 0.5)
@@ -937,6 +950,9 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1
         with mp.Pool(n_workers, initializer=init_classifier_worker,
                      initargs=(A, classifier)) as pool:
             weight_list = pool.map(fit_node_classifier_worker, vectors)
+
+
+
     else:
         weight_list = [fit_linear_classifier(A, vector, method=classifier) for vector in vectors]
 
@@ -944,6 +960,17 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1
 
     return weight_dict, labels
 
+# Writes a file for later use of kmer-weight file and writes optimal decision threshold
+# Structured as "<float decision_thresh>\n<tsv kmer-weight>"
+def write_weight_file(weights, reverse_dict, trait=None, outdir=None, threshold=0.5):
+
+    out_file = os.path.join(outdir, f"weight_dict_{trait}.tsv.gz")
+    with gzip.open(out_file, 'wt', encoding='utf-8') as f:
+        f.write(f"{threashold}\n")
+        for index, weight in enumerate(weights):
+            f.write(f"{reverse_dict[index]}\t{weight}")
+
+def read_weight_file()
 
 # ---------------------------------------------------------------------------
 # k-mer assembly
@@ -1289,6 +1316,7 @@ def main():
 
     # 4. Build feature matrix
     A, index_dict = montaA(sequences)
+    write_index_file(index_dict, out_dir)
     reverse_dict = inversa_k(index_dict)
 
 
@@ -1355,7 +1383,15 @@ def main():
                 important_lowest = [inversa(int(idx), reverse_dict) for idx in lowest_idx]
                 important_highest = [inversa(int(idx), reverse_dict) for idx in highest_idx]
                 f.write(f"{node_label}\nall_kmers\n{','.join(important_kmers)}\nlowest_kmers\n{','.join(important_lowest)}\nhighest_kmers\n{','.join(important_highest)}\n")
+
+        # Write kmer -> weight mapping for every node in the tree
+
+        for node, weights in weight_dict.items():
+            write_weight_file(weights, reverse_dict, trait=node, outdir=out_dir)
+
         time_nodes = time.time() - time_nodes
+
+
         print(f"Internal node classification time: {time_nodes:.2f} seconds")
         print(f"Internal node classification written to {report_path}")
 
