@@ -87,7 +87,7 @@ from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix
 import scipy.sparse as sp
 from optht import optht
-
+from numba import njit
 
 
 from sklearn.decomposition import TruncatedSVD
@@ -820,19 +820,23 @@ def classify_new_sequences(A, sequences, trained_vector, threshold, k,trait=None
             for i in range(len(sequences)):
                     f.writelines(f"{sequences[i].id}\t{seq_scores[i]}\t{seq_classification[i]}\n")
 
-def vectorize_new(seq : str, weight_dict, k):
-    prev_kmers = set(weight_dict.keys())
+
+@njit(fastmath=True)
+def vectorize_new(seq : str, seen : set, k):
+    freq_dict = defaultdict(int)
     seq_bytes = seq.encode("ascii")
     mv = memoryview(seq_bytes)
-    count = 0
     for i in range(len(seq)-k + 1):
-        mv[i:i+k]
-        if
+        kmer = mv[i:i+k]
+        if bytes(kmer) in seen:
+            continue
+        else:
+            freq_dict[mv] += 1
+    return freq_dict
 
 
+def vectorization_worker(batch, weight_dict):
 
-def vectorization_worker(batch):
-    vectors = []
 
     for record in batch:
         id = record.id
