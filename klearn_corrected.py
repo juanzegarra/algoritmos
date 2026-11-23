@@ -70,6 +70,8 @@ import multiprocessing as mp
 import time
 from collections import defaultdict
 import gzip
+import ahocorasick
+import subprocess
 
 
 import numpy as np
@@ -367,57 +369,39 @@ def montaA(sequencias):
 
     return a, index_dict
 
-def write_index_file(index_dict, out_dir=None):
+def front_encoding(kmers):                     # kmers must be sorted
+    encoded, prev = [], ""
+    for km in kmers:
+        j, m = 0, min(len(prev), len(km))
+        while j < m and prev[j] == km[j]:
+            j += 1
+        encoded.append((j, km[j:]))
+        prev = km
+    return encoded
+
+def front_decoding(encoded):
+    decoded, prev = [], ""
+    for shared, suffix in encoded:
+        prev = prev[:shared] + suffix
+        decoded.append(prev)
+    return decoded
+
+def write_index_file(index_dict, out_dir):
     os.makedirs(out_dir, exist_ok=True)
-    encoded_l = ",".join(front_encoding(list(index_dict.keys())))
-    with gzip.open(f"{out_dir}/index.f.gz", "w") as f:
-        f.write(encoded_l)
+    kmers = sorted(index_dict, key=index_dict.get)       # column order
+    with gzip.open(os.path.join(out_dir, "index.f.gz"), "wt", encoding="utf-8") as f:
+        for shared, suffix in front_encoding(kmers):
+            f.write(f"{shared}\t{suffix}\n")
 
 def read_index_file(index_file):
     if not os.path.isfile(index_file):
-        print("Index file not found, please check file path or name.")
-        return
-    index_dict = defaultdict(int)
-    with gzip.open(index_file, "r") as f:
-        line = f.read().strip()
-        line = list(front_decoding(line)).split(",")
-        index_dict = {kmer : i for kmer, i in enumerate(line)}
-
-    return index_dict
-
-# Use front encoding to compress index list of kmers
-def front_encoding(l):
-    if not l:
-        return
-    encoded_l = []
-    for i in range(len(l)-1):
-        if i == 0:
-            encoded_l.append((0, l[i]))
-        for j in range(len(l[i])):
-            if l[i][j] == l[i+1][j]:
-                continue
-            else:
-                encoded_l.append((j, l[i+1][j:]))
-                break
-    return encoded_l
-
-# Decompress the front enconded text
-def front_decoding(l):
-    decoded_l = []
-    for i in range(len(l) - 1):
-        if i == 0:
-            decoded_l.append(l[i][1])
-        prefix = l[i][1][:l[i+1][0]]
-        next_entry = prefix + l[i+1][1]
-        decoded_l.append(next_entry)
-    return decoded_l
-
-def build_vectors_from_dict(sequencias, index_dict):
-    list_of_indices = []
-    for seq in sequencias:
-        indices = [index_dict[kmer] for kmer in seq.kmer_vector]
-        list_of_indices.append(indices)
-    return list_of_indices
+        raise FileNotFoundError(index_file)
+    encoded = []
+    with gzip.open(index_file, "rt", encoding="utf-8") as f:
+        for line in f:
+            shared, suffix = line.rstrip("\n").split("\t")
+            encoded.append((int(shared), suffix))
+    return {kmer: i for i, kmer in enumerate(front_decoding(encoded))}
 
 # ---------------------------------------------------------------------------
 # Feature matrix / dimensionality reduction / clustering
@@ -593,6 +577,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     selected_idx = None
 
 
+    final_w, final_b = None, 0.0
+
     if method == 'linear' and weight_reduction is not None:
         w = fit_linear_classifier(X_train, y_train, method='linear')
         w_selected, selected_idx, lowest_idx, highest_idx = reduce_weights(
@@ -616,6 +602,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         scores_all = sigmoid(A @ w_selected)
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
+        final_w = w_selected
+
     elif method == 'linear':
         w = fit_linear_classifier(X_train, y_train, method='linear')
 
@@ -636,6 +624,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         scores_all = sigmoid(A @ w)
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
+        final_w = w
+
     elif method == 'logreg':
         if weight_reduction is not None:
             print(f"Note: --weight_reduction only applies to --classifier linear; "
@@ -650,6 +640,9 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         # All data predictions
         y_pred_all = model.predict(A)
         scores_all = model.predict_proba(A)[:, 1]
+
+        final_w = model.coef_.ravel(); final_b = float(model.intercept_[0])
+
     else:
         raise ValueError(f"Unknown classifier method: {method}")
 
@@ -667,7 +660,7 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     fig.colorbar(im, ax=axes[0])
 
     if len(np.unique(y_test)) > 1:
-        fpr, tpr, _ = roc_curve(y_test, scores_test, best_threshold)
+        fpr, tpr, _ = roc_curve(y_test, scores_test)
         roc_auc = auc(fpr, tpr)
         axes[1].plot(fpr, tpr, label=f'AUC = {roc_auc:.2f}')
         axes[1].plot([0, 1], [0, 1], linestyle='--', color='gray')
@@ -698,21 +691,15 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
                     f"{', '.join(important_kmers)}\n"
                     f"Lowest kmers: {', '.join(important_lowest)}\n"
                     f"Highest kmers: {', '.join(important_highest)}\n")
-    if (w_selected is not None) and reverse_dict:
-        write_weight_file(w_selected, reverse_dict, trait= trait_name, threshold=best_threshold)
-    elif (w is not None and w_selected is None) and reverse_dict:
-        write_weight_file(w, reverse_dict, trait= trait_name, threshold=best_threshold)
+    if final_w is not None and reverse_dict:
+        write_weight_file(final_w, reverse_dict, trait=trait_name, outdir=out_dir,
+                            threshold=best_threshold, intercept=final_b)
+
     # Generate two plots: one strictly for the test partition, one for the whole dataset
     plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test", best_threshold=best_threshold or 0.5)
     plot_logit_classification(ids_all, indicadores, scores_all, y_pred_all, out_dir, f"{trait_name}_all", best_threshold=best_threshold or 0.5)
 
     return accuracy
-
-def coordinate_compression(l):
-    compressed_data = set(l)
-    rows, columns = [], []
-
-    for i in range(len(l)):
 
 
 def plot_logit_classification(sample_ids, y_true, scores, y_pred, out_dir, trait_name, best_threshold=0.5):
@@ -807,61 +794,90 @@ def reduce_weights(A, weight_vector, indicadores, classifier='linear', out_dir=N
     # Return your new full-sized sparse model instead of the truncated one
     return trained_model, final_original_idx, lowest_idx, highest_idx
 
-def classify_new_sequences(A, sequences, trained_vector, threshold, k,trait=None, model_name=None):
-    A_predictions = A @ trained_vector
-    seq_scores = sigmoid(A_predictions)
-    seq_classification = np.where(seq_scores < threshold, 0, 1)
-    if len(sequences) != len(seq_classification):
-        print("Trained vector and sequences do not match dimensions, exiting...")
-        return
-    else:
-        with open(f"model_classifcation{trait}.txt", "w") as f:
-            f.write(f"#CLASSIFICATIONS RETURNED BY MODEL {model_name} threshold value {threshold}\nID\tlogit_score\tclassifcation\n")
-            for i in range(len(sequences)):
-                    f.writelines(f"{sequences[i].id}\t{seq_scores[i]}\t{seq_classification[i]}\n")
+##########################################################################################
+# Classify new input sequences
+##########################################################################################
 
+def build_aho_automaton(kmers):
+    automaton = ahocorasick.Automaton()
+    for i, kmer in enumerate(kmers):
+        automaton.add_word(kmer, i)          # add_word(key, value): two arguments
+    automaton.make_automaton()               # required before .iter()
+    return automaton
 
-@njit(fastmath=True)
-def vectorize_new(seq : str, seen : set, k):
-    freq_dict = defaultdict(int)
-    seq_bytes = seq.encode("ascii")
-    mv = memoryview(seq_bytes)
-    for i in range(len(seq)-k + 1):
-        kmer = mv[i:i+k]
-        if bytes(kmer) in seen:
-            continue
+def open_text(path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "r")
+
+def iter_fasta_batches(path, batch_size=1000):
+    batch = []
+    with open_text(path) as handle:
+        for record in SeqIO.parse(handle, "fasta"):
+            batch.append((record.id, str(record.seq).upper()))
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+    if batch:
+        yield batch
+
+_scorer = {}
+
+def _init_scorer(kmers, weights, intercept, threshold):
+    _scorer["automaton"] = build_aho_automaton(kmers)   # one automaton per worker
+    _scorer["w"], _scorer["b"], _scorer["t"] = weights, intercept, threshold
+
+def score_batch(batch):
+    automaton, w, b, t = _scorer["automaton"], _scorer["w"], _scorer["b"], _scorer["t"]
+    out = []
+    for seq_id, seq in batch:
+        z = b
+        for _, idx in automaton.iter(seq):   # overlapping matches included
+            z += w[idx]                      # == dot(counts, weights)
+        score = float(sigmoid(z))
+        out.append((seq_id, score, int(score >= t)))
+    return out
+
+def classify_fasta_stream(fasta_path, weight_file, out_path, processes=1, batch_size=1000):
+    weight_dict, threshold, intercept = read_weight_file(weight_file)
+    kmers = sorted(weight_dict)
+    weights = [weight_dict[km] for km in kmers]
+    batches = iter_fasta_batches(fasta_path, batch_size)
+    n = 0
+    with open(out_path, "w") as out:
+        out.write("seqID\tscore\tclassification\n")
+        if processes > 1:
+            with mp.Pool(processes, initializer=_init_scorer,
+                         initargs=(kmers, weights, intercept, threshold)) as pool:
+                for results in pool.imap(score_batch, batches):
+                    for seq_id, score, cls in results:
+                        out.write(f"{seq_id}\t{score:.6f}\t{cls}\n")
+                    n += len(results)
         else:
-            freq_dict[mv] += 1
-    return freq_dict
-
-
-def vectorization_worker(batch, weight_dict):
-
-
-    for record in batch:
-        id = record.id
-        seq = str(record.seq)
-        vectorize_new()
-
-
-
+            _init_scorer(kmers, weights, intercept, threshold)
+            for batch in batches:
+                for seq_id, score, cls in score_batch(batch):
+                    out.write(f"{seq_id}\t{score:.6f}\t{cls}\n")
+                    n += 1
+    return n
 # ---------------------------------------------------------------------------
 # Phylogenetics
 # ---------------------------------------------------------------------------
 
+def cosine_distance_matrix(A):
+    if sp.issparse(A):
+        Af = A.astype(np.float64)
+        G = (Af @ Af.T).toarray()
+        norms = np.sqrt(np.diag(G)); norms[norms == 0] = 1.0
+        D = 1.0 - G / np.outer(norms, norms)
+        np.fill_diagonal(D, 0.0)
+        return np.clip(D, 0.0, 2.0)
+    return squareform(pdist(A, metric="cosine"))
+
 def neighbor_join_reduced(A, sample_labels):
-
-    dist_condensed = pdist(A, metric='cosine')
-    square_form = squareform(dist_condensed)
-
-    # Biopython's DistanceMatrix wants a lower-triangular "ragged" matrix:
-    # row i must have exactly i+1 entries (including the 0 diagonal).
+    square_form = cosine_distance_matrix(A)
     lower_triangular = [list(square_form[i, :i + 1]) for i in range(square_form.shape[0])]
-
     bio_dm = DistanceMatrix(names=list(sample_labels), matrix=lower_triangular)
-    constructor = DistanceTreeConstructor()
-    tree = constructor.nj(bio_dm)
-    return tree
+    return DistanceTreeConstructor().nj(bio_dm)
+
 
 def initialize_bootstrap(A, sample_labels):
     global global_A
@@ -982,37 +998,32 @@ def classify_internal_nodes(tree, A, sequences, classifier='linear', processes=1
 
 # Writes a file for later use of kmer-weight file and writes optimal decision threshold
 # Structured as "<float decision_thresh>\n<tsv kmer-weight>"
-def write_weight_file(weights, reverse_dict, trait=None, outdir=None, threshold=0.5):
+def _safe(name):
+    return "".join(c if c.isalnum() else "_" for c in str(name))
 
-    out_file = os.path.join(outdir, f"weight_dict_{trait}.tsv.gz")
-    with gzip.open(out_file, 'wt', encoding='utf-8') as f:
-        f.write(f"{threashold}\n")
-        for index, weight in enumerate(weights):
-            f.write(f"{reverse_dict[index]}\t{weight}")
+def write_weight_file(weights, reverse_dict, trait="model", outdir=".", threshold=0.5, intercept=0.0):
+    """gzip TSV. Line 1: threshold<TAB>intercept. Line 2: header. Then kmer<TAB>weight (non-zero only)."""
+    os.makedirs(outdir, exist_ok=True)
+    out_file = os.path.join(outdir, f"weight_dict_{_safe(trait)}.tsv.gz")
+    with gzip.open(out_file, "wt", encoding="utf-8") as f:
+        f.write(f"{float(threshold)}\t{float(intercept)}\n")
+        f.write("kmer\tweight\n")
+        for idx in np.flatnonzero(weights):
+            f.write(f"{reverse_dict[int(idx)]}\t{float(weights[idx])}\n")
+    return out_file
 
 def read_weight_file(weight_file):
-
+    """Returns (weight_dict, threshold, intercept)."""
     if not os.path.isfile(weight_file):
-        print("Could not find kmer-weight file, please check path or name.")
-        return
-
-    with gzip.open(weight_file, "r") as f:
-        line1 = f.readline()
-        try:
-            threshold = float(line1.strip())
-        except:
-            print("Malformatted weight file, could not retrive optimal threshold.")
-            return
-
-        try:
-            kmer_weight_df = pd.read_csv(weight_file, sep="\t")
-            kmer_weight_dict = kmer_weight_df.set_index(kmer_weight_df.columns[0])[kmer_weight_df.columns[1]].to_dict()
-
-        except:
-            print("Malformatted weight file, could not retrive table.")
-            return
-
-    return kmer_weight_dict, threshold
+        raise FileNotFoundError(f"Could not find kmer-weight file: {weight_file}")
+    with gzip.open(weight_file, "rt", encoding="utf-8") as f:
+        threshold, intercept = (float(x) for x in f.readline().split("\t"))
+        f.readline()                                     # header
+        weight_dict = {}
+        for line in f:
+            kmer, weight = line.rstrip("\n").split("\t")
+            weight_dict[kmer] = float(weight)
+    return weight_dict, threshold, intercept
 
 
 
@@ -1108,7 +1119,7 @@ def weight_contigs(kmer_weight_dict, k, contigs):
         kmer_set = set(all_kmers)
 
         for kmer in kmer_set:
-            total_sum += float(kmer_weight_dict[kmer])
+            total_sum += float(kmer_weight_dict.get(kmer, 0.0))
 
         contig_weight[seq] = total_sum
 
@@ -1143,38 +1154,14 @@ def parse_assembled_file(path):
 
 
 def parse_node_classification_file(path):
-    """Parse a node_classification.txt file (one line per tree node:
-    `node_label<TAB>kmer1,kmer2,...\n lowest_kmers\n highest_kmers`, as written by the --classify_nodes
-    report). Returns {node_label: (kmers, lowest_kmers, highest_kmers)}, skipping any node with an
-    empty k-mer list."""
-    entries = {}
+    with open(path) as f:
+        lines = [l.rstrip("\n") for l in f]
+    split = lambda s: [km for km in s.split(",") if km]
+    return {lines[i]: (split(lines[i+2]), split(lines[i+4]), split(lines[i+6]))
+            for i in range(0, len(lines) - 6, 7)}
 
-    with open(path, "r") as f:
-        lines = f.readlines()
-        new_node = False
-        all_kmers = None
-        highest_kmers = None
-        lowest_kmers = None
-        node_label = None
-        for i in range(len(lines)):
-            line = lines[i].strip("\n")
-            if not line:
-                continue
-            if "node_" or  "Inner" in line:
-                node_label = line
-                new_node = True
-                all_kmers = lines[i+2].strip().split(",")
-                lowest_kmers = lines[i+4].strip().split(",")
-                highest_kmers = lines[i+6].strip().split(",")
-
-            if lowest_kmers and highest_kmers and new_node:
-                entries[node_label] = (all_kmers, lowest_kmers, highest_kmers)
-                new_node = False
-                highest_kmers = None
-                lowest_kmers = None
-                all_kmers = None
-
-    return entries
+def weight_file_for(label, directory):
+    return os.path.join(directory, f"weight_dict_{_safe(label)}.tsv.gz")
 
 def parse_trait_report_file(path):
     """Parse a classifier_<trait>_report.txt file (as written by
@@ -1236,12 +1223,15 @@ def main():
     # standalone mode: it does not need --anno or --phylo.
     if assemble_target:
         if not trained_vector:
-            print("Lacking tsv file that maps kmers to their weight")
-            return
+            try:
+                weight_file_for(label, assemble_dir)
+            except:
+                print("Lacking tsv file that maps kmers to their weight")
+                return
         time_kmers = time.time()
         print(f"Assembling k-mers from {assemble_target}...")
 
-        kmer_weight_dict, threshold = read_weight_file(trained_vector) # decision threshold and kmer -> associated weight returned by classifier
+        kmer_weight_dict, threshold, _ = read_weight_file(trained_vector) # decision threshold and kmer -> associated weight returned by classifier
         kmer_sources = {}  # label -> list of kmer strings for every file (node_classification or classification_report)
 
         if os.path.isdir(assemble_target):
@@ -1392,7 +1382,7 @@ def main():
         time_tree = time.time()
         sample_labels = [seq.display_name if seq.display_name else seq.id for seq in sequences]
         if args.bootstraps == 0:
-            tree = neighbor_join_reduced(A_reduced, sample_labels)
+            tree = neighbor_join_reduced(A_k, sample_labels)
             Phylo.write(tree, os.path.join(out_dir, "tree.newick"), "newick")
             fig, ax = plt.subplots(figsize=(10, 8))
             Phylo.draw(tree, axes=ax, do_show=False)
@@ -1414,10 +1404,11 @@ def main():
             for node, w in weight_dict.items():
                 indicadores = label_arrays[node]
                 node_label = node.name if node.name else f"node_{id(node)}"
-                _, selected_idx, lowest_idx, highest_idx = reduce_weights(
+                trained_model, selected_idx, lowest_idx, highest_idx = reduce_weights(
                     A, w, indicadores, classifier=classifier_method, out_dir=out_dir,
                     n_weights=weight_reduction or DEFAULT_N_WEIGHTS, label=node_label
                 )
+                write_weight_file(trained_model, reverse_dict, trait=node_label, outdir=out_dir)
                 important_kmers = [inversa(int(idx), reverse_dict) for idx in selected_idx]
                 important_lowest = [inversa(int(idx), reverse_dict) for idx in lowest_idx]
                 important_highest = [inversa(int(idx), reverse_dict) for idx in highest_idx]
@@ -1468,19 +1459,20 @@ def main():
     # Uses threshhold value information from kmer-weight file to classify
     # Returns a tsv file with seqID, classification and sigmoid score
 
+    # --- Classify new sequences (standalone mode, streams the FASTA, .gz ok) ---
     if args.classify:
-        print(f"Beggining to classify sequences from {args.fasta}")
-        if args.phylo or args.anno:
-            print("Incompatible modes, exiting...")
+        if args.phylo or args.anno or args.assemble_kmers:
+            print("--classify cannot be combined with --phylo, --anno or --assemble_kmers.")
             return
-
-        if not args.trained_vector:
-            print("Missing trained vector file for classifcation, please input.")
+        if not args.fasta or not trained_vector:
+            print("--classify needs --fasta (optionally .gz) and --trained_vector.")
             return
+        t0 = time.time()
+        out_path = os.path.join(out_dir, "classification_results.tsv")
+        n = classify_fasta_stream(args.fasta, trained_vector, out_path, processes=processes)
+        print(f"Classified {n} sequences in {time.time() - t0:.2f}s -> {out_path}")
+        return
 
-        trained_vector = args.trained_vector
-        weight_kmer_dict, threshold = read_weight_file(trained_vector)
-        k = len(weight_kemr_dict.keys()[1])
 
 
 
