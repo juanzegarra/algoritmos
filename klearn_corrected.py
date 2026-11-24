@@ -90,6 +90,8 @@ from scipy.sparse import csr_matrix
 import scipy.sparse as sp
 from optht import optht
 from numba import njit
+from scipy.special import expit
+
 
 
 from sklearn.decomposition import TruncatedSVD
@@ -164,7 +166,8 @@ def parse_args():
     parser.add_argument('--trained_vector', type=str, default=None, metavar='PATH',
                         help='File output by weight reduction that is used to return'
                             'the summation of weight values during assembly.')
-    parser.add_argument('--classify', default=None, action='store_true')
+    parser.add_argument('--classify', default=None, action='store_true',
+                        help="Change mode to classify new sequences, fasta entry will be parsed based on previous learned vector")
 
 
     return parser.parse_args()
@@ -302,12 +305,7 @@ def read_annotations(anno_file, sequences):
 
         if has_display and pd.notna(row.get("Display")):
             display_name = str(row["Display"])
-            if len(display_name) <= 50:
-                seq_by_id[seq_id].display_name = display_name
-            else:
-                print("Display name with more than 50 chars, exiting")
-                return
-
+            seq_by_id[seq_id].display_name = display_name
         try:
             # Extract float values only for actual traits, ignoring 'Display'
             values = [float(row[col]) for col in trait_names]
@@ -421,18 +419,36 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     A 3D scatter plot of A_pca_scaled is saved to out_dir/pca_scaled.png."""
     m, n = A.shape
 
-    G = (A @ A.T).toarray()
+    A64 = A.astype(np.float64)
+
+    G = (A64 @ A64.T).toarray()
+
     ev = eigh(G, eigvals_only=True)[::-1]
     svs = np.sqrt(np.maximum(ev, 0.0))
     beta = min(m, n) / max(m, n)
+
     optimal_k = optht(beta, svs)
+
+    # Inspect singular values around the threshold
+    sorted_svs = np.sort(svs)[::-1]
+
+    print("Singular values around cutoff:")
+    print(sorted_svs[manual_rank - 3:manual_rank + 3])
+
+    optimal_k = optht(beta, svs)
+    print(f"Optimal k value solution {optimal_k}")
     optimal_k = max(int(optimal_k), 1)
 
     svd_optimal = TruncatedSVD(n_components=optimal_k, random_state=42)
     A_k = svd_optimal.fit_transform(A)
 
     s = svd_optimal.singular_values_
-    sum_s2_total = np.sum(s ** 2)
+    sum_s2_total = np.sum(svs ** 2)
+    sum_s2_top = np.sum(s[:n_top] ** 2)
+
+    alpha = np.sqrt(
+        (target_variance * sum_s2_total) / sum_s2_top
+    )
     n_top = min(3, A_k.shape[1])
     explained_variance = np.sort(svd_optimal.explained_variance_ratio_)
     cumulative_variance = np.cumsum(ev) / ev.sum()
@@ -445,8 +461,6 @@ def singular(A, out_dir, labels=None, target_variance=0.70):
     scree_fig.savefig(os.path.join(out_dir, "svd.png"))
     plt.close(scree_fig)
 
-    sum_s2_top = np.sum(s[:n_top] ** 2)
-    alpha = np.sqrt((target_variance * sum_s2_total) / sum_s2_top) if sum_s2_top > 0 else 1.0
 
     V_top = svd_optimal.components_[:n_top, :]
     A_top = A @ V_top.T
@@ -588,14 +602,48 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
 
         scores_train = sigmoid(X_train @ w_selected)
         scores_test = sigmoid(X_test @ w_selected)
+
+        logits_train = np.asarray(X_train @ w_selected).reshape(-1)
+        scores_train = expit(logits_train)
+
+        # Test logits and probabilities
+        logits_test = np.asarray(X_test @ w_selected).reshape(-1)
+        scores_test = expit(logits_test)
+
+        for label in [0, 1]:
+            z = logits_test[y_test == label]
+
+            print(f"\nTest class {label}:")
+            print("Count:", len(z))
+            print("Logit percentiles:",
+                  np.percentile(z, [0, 10, 25, 50, 75, 90, 100]))
+
+        print("Weight vector shape:", w_selected.shape)
+        print("Training matrix shape:", X_train.shape)
+        print("Logit shape:", logits_train.shape)
+        print("Score shape:", scores_train.shape)
+
+        print("Maximum difference:",
+              np.max(np.abs(expit(logits_train) - scores_train)))
+
+        print("Number of exact 0.5 scores:",
+              np.sum(scores_train == 0.5))
         # Find best threshold value for maximizing specifity and sensitivity product
         fpr, tpr, thresholds = roc_curve(y_train, scores_train)
         specificity = 1 - fpr
-        harmonic_avr = (specificity * tpr) / (specificity + tpr)
+        denominator = specificity + tpr
 
-        optimal_idx = np.argmax(harmonic_avr)
-        best_threshold = thresholds[optimal_idx]
+        harmonic_avr = np.divide(
+            2 * specificity * tpr,
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0
+        )
 
+        valid = np.isfinite(thresholds)
+
+        optimal_idx = np.argmax(harmonic_avr[valid])
+        best_threshold = thresholds[valid][optimal_idx]
         y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
 
         # All data predictions
@@ -603,6 +651,21 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
         final_w = w_selected
+        logits_train = np.asarray(X_train @ w_selected).ravel()
+
+        for label in [0, 1]:
+            z = logits_train[y_train == label]
+
+            print(f"\nClass {label}:")
+            print("Count:", len(z))
+            print("Logit percentiles:",
+                  np.percentile(z, [0, 10, 25, 50, 75, 90, 100]))
+
+
+        print("Score distribution:")
+        print(np.percentile(scores_train, [0, 10, 25, 50, 75, 90, 99, 100]))
+
+        print("Selected threshold:", best_threshold)
 
     elif method == 'linear':
         w = fit_linear_classifier(X_train, y_train, method='linear')
@@ -613,11 +676,19 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         # Find best threshold value for maximizing specifity and sensitivity product
         fpr, tpr, thresholds = roc_curve(y_train, scores_train)
         specificity = 1 - fpr
-        harmonic_avr = (specificity * tpr) / (specificity + tpr)
+        denominator = specificity + tpr
 
-        optimal_idx = np.argmax(harmonic_avr)
-        best_threshold = thresholds[optimal_idx]
+        harmonic_avr = np.divide(
+            2 * specificity * tpr,
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0
+        )
 
+        valid = np.isfinite(thresholds)
+
+        optimal_idx = np.argmax(harmonic_avr[valid])
+        best_threshold = thresholds[valid][optimal_idx]
         y_pred_test = np.where(scores_test >= best_threshold, 1, 0)
 
         # All data predictions
@@ -625,6 +696,11 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
         y_pred_all = np.where(scores_all >= best_threshold, 1, 0)
 
         final_w = w
+        print(np.percentile(scores_train, [0, 10, 25, 50, 75, 90, 99, 100]))
+
+        print("Selected threshold:", best_threshold)
+
+
 
     elif method == 'logreg':
         if weight_reduction is not None:
@@ -694,6 +770,8 @@ def evaluate_classifier(A, indicadores, out_dir, trait_name='trait', method='log
     if final_w is not None and reverse_dict:
         write_weight_file(final_w, reverse_dict, trait=trait_name, outdir=out_dir,
                             threshold=best_threshold, intercept=final_b)
+
+
 
     # Generate two plots: one strictly for the test partition, one for the whole dataset
     plot_logit_classification(ids_test, y_test, scores_test, y_pred_test, out_dir, f"{trait_name}_test", best_threshold=best_threshold or 0.5)
@@ -830,14 +908,20 @@ def score_batch(batch):
     out = []
     for seq_id, seq in batch:
         z = b
+        n_matches = 0
         for _, idx in automaton.iter(seq):   # overlapping matches included
             z += w[idx]                      # == dot(counts, weights)
-        score = float(sigmoid(z))
-        out.append((seq_id, score, int(score >= t)))
+            n_matches += 1
+        if n_matches != 0:
+            score = float(expit(z))
+            out.append((seq_id, score, int(score >= t)))
     return out
 
 def classify_fasta_stream(fasta_path, weight_file, out_path, processes=1, batch_size=1000):
     weight_dict, threshold, intercept = read_weight_file(weight_file)
+    print(f"Loaded {len(weight_dict)} weighted k-mers")
+    print(f"Decision threshold: {threshold}")
+    print(f"Intercept: {intercept}")
     kmers = sorted(weight_dict)
     weights = [weight_dict[km] for km in kmers]
     batches = iter_fasta_batches(fasta_path, batch_size)
@@ -1218,6 +1302,13 @@ def main():
     weight_reduction = args.weight_reduction
     trained_vector = args.trained_vector
 
+    # Check if there is something to do
+    if not args.anno and not args.phylo and not args.classify:
+        print("Error: nothing to do. Provide --anno for annotation-based classification, "
+              "and/or --phylo (with --classify_nodes) for tree-based node classification, "
+              "and/or --assemble_kmers to assemble k-mers from a previous run's reports.")
+        return
+
     # Assemble k-mers from a file (or directory) produced by an earlier run's
     # --classify_nodes / --anno + --weight_reduction reports. This is a
     # standalone mode: it does not need --anno or --phylo.
@@ -1296,71 +1387,66 @@ def main():
     annotation_mode = args.anno is not None
     tree_mode = args.phylo
 
-    if not annotation_mode and not tree_mode:
-        print("Error: nothing to do. Provide --anno for annotation-based classification, "
-              "and/or --phylo (with --classify_nodes) for tree-based node classification, "
-              "and/or --assemble_kmers to assemble k-mers from a previous run's reports.")
-        return
-
     if args.classify_nodes and not args.phylo:
         print("Error: --classify_nodes requires --phylo to build a tree first.")
         return
 
-    # 1. Read sequences
-    sequences = read_fasta(args.fasta)
-    if not sequences:
-        print("No sequences found. Exiting.")
-        return
-
-    # 2. Read annotations, if provided (annotation-based classification mode).
-    #    Tree-based node classification does not need this at all.
-    trait_names = []
-    annotation_matrix = None
-    if annotation_mode:
-        trait_names = read_annotations(args.anno, sequences)
-        sequences = [s for s in sequences if s.anno is not None]
+    if not args.classify and not args.trained_vector:
+        # 1. Read sequences
+        sequences = read_fasta(args.fasta)
         if not sequences:
-            print("No sequences with matching annotations found. Exiting.")
+            print("No sequences found. Exiting.")
             return
-        if not trait_names:
-            print("No trait columns found in annotation file. Exiting.")
-            return
-        annotation_matrix = create_annotation_vector(sequences)
 
-    # 3. K-merize (parallel or sequential)
-    time_kmerization = time.time()
+        # 2. Read annotations, if provided (annotation-based classification mode).
+        #    Tree-based node classification does not need this at all.
+        trait_names = []
+        annotation_matrix = None
+        if annotation_mode:
+            trait_names = read_annotations(args.anno, sequences)
+            sequences = [s for s in sequences if s.anno is not None]
+            if not sequences:
+                print("No sequences with matching annotations found. Exiting.")
+                return
+            if not trait_names:
+                print("No trait columns found in annotation file. Exiting.")
+                return
+            annotation_matrix = create_annotation_vector(sequences)
 
-    if processes > 1:
-        with Pool(processes=processes) as pool:
-            results = pool.starmap(kmerize_sequence, [(s.seq, k) for s in sequences])
-    else:
-        results = [kmerize_sequence(s.seq, k) for s in sequences]
+        # 3. K-merize (parallel or sequential)
+        time_kmerization = time.time()
 
-    for seq, (vector, invalid) in zip(sequences, results):
-        seq.kmer_vector = vector
-        for window in invalid:
-            print(f"Warning: invalid character in kmer of {seq.id}: {window}")
-    time_kmerization = time.time() - time_kmerization
-    print(f"K-merization time: {time_kmerization:.2f} seconds")
+        if processes > 1:
+            with Pool(processes=processes) as pool:
+                results = pool.starmap(kmerize_sequence, [(s.seq, k) for s in sequences])
+        else:
+            results = [kmerize_sequence(s.seq, k) for s in sequences]
 
-    # 4. Build feature matrix
-    A, index_dict = montaA(sequences)
-    write_index_file(index_dict, out_dir)
-    reverse_dict = inversa_k(index_dict)
+        for seq, (vector, invalid) in zip(sequences, results):
+            seq.kmer_vector = vector
+            for window in invalid:
+                print(f"Warning: invalid character in kmer of {seq.id}: {window}")
+        time_kmerization = time.time() - time_kmerization
+        print(f"K-merization time: {time_kmerization:.2f} seconds")
+
+        # 4. Build feature matrix
+        A, index_dict = montaA(sequences)
+        write_index_file(index_dict, out_dir)
+        reverse_dict = inversa_k(index_dict)
 
 
 
-    # 5. SVD / PCA visualization
-    time_visualization = time.time()
-    color_labels = annotation_matrix[:, 0] if annotation_matrix is not None else None
-    A_reduced, A_k, optimal_k = singular(A, out_dir, labels=color_labels)
-    np.save(os.path.join(out_dir, "A_reduced.npy"), A_reduced)
-    np.save(os.path.join(out_dir, "A_k.npy"), A_k)
+        # 5. SVD / PCA visualization
+        time_visualization = time.time()
+        color_labels = annotation_matrix[:, 0] if annotation_matrix is not None else None
+        A_reduced, A_k, optimal_k = singular(A, out_dir, labels=color_labels)
+        np.save(os.path.join(out_dir, "A_reduced.npy"), A_reduced)
+        np.save(os.path.join(out_dir, "A_k.npy"), A_k)
 
-    # 6. Unsupervised clustering as a visual sanity check
-    run_kmeans(A_reduced, optimal_k, out_dir)
-    time_visualization = time.time() - time_visualization
-    print(f"Visualization time: {time_visualization:.2f} seconds")
+        # 6. Unsupervised clustering as a visual sanity check
+        run_kmeans(A_reduced, optimal_k, out_dir)
+        time_visualization = time.time() - time_visualization
+        print(f"Visualization time: {time_visualization:.2f} seconds")
 
     # 7. Annotation-based classification accuracy for every trait
     if annotation_mode:
@@ -1389,7 +1475,7 @@ def main():
             plt.savefig(os.path.join(out_dir, "tree_image.png"), dpi=300, bbox_inches="tight")
             plt.close(fig)
         else:
-            tree = bootstrap(A, args.bootstraps, sequences, args.tree_cutoff, out_dir, processes=processes)
+            tree = bootstrap(A_k, args.bootstraps, sequences, args.tree_cutoff, out_dir, processes=processes)
         time_tree = time.time() - time_tree
         print(f"Phylogenetic tree construction time: {time_tree:.2f} seconds")
 
@@ -1397,7 +1483,7 @@ def main():
     if args.classify_nodes:
         time_nodes = time.time()
         weight_dict, label_arrays = classify_internal_nodes(
-            tree, A, sequences, classifier=classifier_method, processes=processes
+            tree, A_k, sequences, classifier=classifier_method, processes=processes
         )
         report_path = os.path.join(out_dir, "node_classification.txt")
         with open(report_path, "w") as f:
@@ -1405,10 +1491,10 @@ def main():
                 indicadores = label_arrays[node]
                 node_label = node.name if node.name else f"node_{id(node)}"
                 trained_model, selected_idx, lowest_idx, highest_idx = reduce_weights(
-                    A, w, indicadores, classifier=classifier_method, out_dir=out_dir,
+                    A_k, w, indicadores, classifier=classifier_method, out_dir=out_dir,
                     n_weights=weight_reduction or DEFAULT_N_WEIGHTS, label=node_label
                 )
-                write_weight_file(trained_model, reverse_dict, trait=node_label, outdir=out_dir)
+
                 important_kmers = [inversa(int(idx), reverse_dict) for idx in selected_idx]
                 important_lowest = [inversa(int(idx), reverse_dict) for idx in lowest_idx]
                 important_highest = [inversa(int(idx), reverse_dict) for idx in highest_idx]
@@ -1436,7 +1522,7 @@ def main():
         f.write(f"node classification time\t{time_nodes:.2f} seconds\n")
 
     # 10. Run classifier on assembled contigs, uses annotation, sequences, and a fasta file with assembled kmers
-    if args.classify_assembled and sequences and trait_names:
+    if args.classify_assembled and trait_name and sequences:
 
         if os.path.isfile(args.classify_assembled):
             assembled = parse_assembled_file(args.classify_assembled)
@@ -1446,10 +1532,10 @@ def main():
         else:
             print(f"Assembled kmers file not found: {args.classify_assembled}")
 
-    elif not trait_names:
+    elif not args.anno and not args.classify:
         print(f"Missing annotation vector for running classifcation, please provide matching annotation file for sequences.")
         return
-    elif not sequences:
+    elif not args.fasta and not args.classify:
        print("Missing fasta file with original sequences used for classification, please provide sequence file.")
        return
 
@@ -1460,7 +1546,7 @@ def main():
     # Returns a tsv file with seqID, classification and sigmoid score
 
     # --- Classify new sequences (standalone mode, streams the FASTA, .gz ok) ---
-    if args.classify:
+    if args.classify :
         if args.phylo or args.anno or args.assemble_kmers:
             print("--classify cannot be combined with --phylo, --anno or --assemble_kmers.")
             return
@@ -1472,10 +1558,6 @@ def main():
         n = classify_fasta_stream(args.fasta, trained_vector, out_path, processes=processes)
         print(f"Classified {n} sequences in {time.time() - t0:.2f}s -> {out_path}")
         return
-
-
-
-
 
 
 if __name__ == '__main__':
